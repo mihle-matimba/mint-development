@@ -51,6 +51,10 @@ const PaymentPage = ({
   const [eftReference, setEftReference] = useState("");
   const [eftSuccessOpen, setEftSuccessOpen] = useState(false);
 
+  // Ozow state
+  const [ozowLoading, setOzowLoading] = useState(false);
+  const ozowFormRef = useRef(null);
+
   const handleMethodSelection = useCallback((method) => {
     setSelectedMethod(method);
     setIsMethodModalOpen(false);
@@ -61,6 +65,65 @@ const PaymentPage = ({
     if (method === "wallet") {
       setPaymentStatus("wallet-pending");
       setWalletConfirmOpen(true);
+      return;
+    }
+    if (method === "ozow") {
+      setPaymentStatus("initializing");
+      setOzowLoading(true);
+      const initiateOzow = async () => {
+        try {
+          const { data: { session } } = await supabase.auth.getSession();
+          const token = session?.access_token;
+          const baseUrl = window.location.origin;
+          const res = await fetch("/api/ozow/initiate", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({
+              amount,
+              strategyName: strategy?.name,
+              strategyId: strategy?.id,
+              userId: profile?.id,
+              userEmail: profile?.email,
+              successUrl: `${baseUrl}/?ozow=success`,
+              cancelUrl: `${baseUrl}/?ozow=cancel`,
+              errorUrl: `${baseUrl}/?ozow=error`,
+              notifyUrl: `${baseUrl}/api/ozow/notify`,
+            }),
+          });
+          const data = await res.json();
+          if (!data.success) throw new Error(data.error || "Failed to initiate Ozow payment");
+
+          // Build and submit a hidden form to Ozow
+          const form = document.createElement("form");
+          form.method = "POST";
+          form.action = data.action_url;
+          const fields = [
+            "SiteCode","CountryCode","CurrencyCode","Amount","TransactionReference",
+            "BankReference","Optional1","Optional2","Optional3","Customer",
+            "CancelUrl","ErrorUrl","SuccessUrl","NotifyUrl","IsTest","HashCheck",
+          ];
+          fields.forEach((key) => {
+            if (data[key] !== undefined && data[key] !== null && data[key] !== "") {
+              const input = document.createElement("input");
+              input.type = "hidden";
+              input.name = key;
+              input.value = data[key];
+              form.appendChild(input);
+            }
+          });
+          document.body.appendChild(form);
+          form.submit();
+        } catch (err) {
+          console.error("[ozow] initiation failed:", err.message);
+          setOzowLoading(false);
+          setPaymentStatus("failed");
+          setErrorMessage(err.message || "Failed to start Ozow payment. Please try another method.");
+        }
+      };
+      initiateOzow();
       return;
     }
     if (method === "direct_eft") {
@@ -446,6 +509,7 @@ const PaymentPage = ({
           amount={amount}
           strategyName={strategy?.name}
           onSelectPaystack={() => handleMethodSelection("paystack")}
+          onSelectOzow={() => handleMethodSelection("ozow")}
           onSelectWallet={() => handleMethodSelection("wallet")}
           onEFTConfirm={() => handleMethodSelection("direct_eft")}
         />
