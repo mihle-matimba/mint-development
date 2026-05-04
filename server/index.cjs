@@ -6289,11 +6289,13 @@ app.post("/api/ozow/initiate", async (req, res) => {
     const optional3 = userId || "";
     const isTest = "false";
 
+    // Always use production URLs for Ozow callbacks — never pass Replit dev URLs
+    // to Ozow or it treats the transaction as a test (R0.01 cap)
     const baseUrl = process.env.APP_URL || "https://mymint.co.za";
-    const resolvedSuccessUrl = successUrl || `${baseUrl}/?ozow=success`;
-    const resolvedCancelUrl = cancelUrl || `${baseUrl}/?ozow=cancel`;
-    const resolvedErrorUrl = errorUrl || `${baseUrl}/?ozow=error`;
-    const resolvedNotifyUrl = notifyUrl || `${baseUrl}/api/ozow/notify`;
+    const resolvedSuccessUrl = `${baseUrl}/?ozow=success`;
+    const resolvedCancelUrl = `${baseUrl}/?ozow=cancel`;
+    const resolvedErrorUrl = `${baseUrl}/?ozow=error`;
+    const resolvedNotifyUrl = `${baseUrl}/api/ozow/notify`;
 
     // Hash order per Ozow spec:
     // SiteCode, CountryCode, CurrencyCode, Amount, TransactionReference, BankReference,
@@ -6319,9 +6321,28 @@ app.post("/api/ozow/initiate", async (req, res) => {
       privateKey,
     );
 
-    const hashCheck = crypto.createHash("sha512").update(hashParts.join("").toLowerCase(), "utf8").digest("hex");
+    const rawHashString = hashParts.join("").toLowerCase();
+    const hashCheck = crypto.createHash("sha512").update(rawHashString, "utf8").digest("hex");
 
-    console.log(`[ozow] Initiated payment: ref=${transactionRef} amount=${amountStr} strategy=${strategyName} userId=${userId}`);
+    console.log(`[ozow] ═══════════════ INITIATE DEBUG ═══════════════`);
+    console.log(`[ozow] SiteCode:           ${siteCode}`);
+    console.log(`[ozow] CountryCode:        ${countryCode}`);
+    console.log(`[ozow] CurrencyCode:       ${currencyCode}`);
+    console.log(`[ozow] Amount:             ${amountStr}`);
+    console.log(`[ozow] TransactionRef:     ${transactionRef}`);
+    console.log(`[ozow] BankReference:      ${bankReference}`);
+    console.log(`[ozow] Optional1:          ${optional1 || "(empty — excluded from hash)"}`);
+    console.log(`[ozow] Optional2:          ${optional2 || "(empty — excluded from hash)"}`);
+    console.log(`[ozow] Optional3:          ${optional3 || "(empty — excluded from hash)"}`);
+    console.log(`[ozow] Customer:           ${customer}`);
+    console.log(`[ozow] CancelUrl:          ${resolvedCancelUrl}`);
+    console.log(`[ozow] ErrorUrl:           ${resolvedErrorUrl}`);
+    console.log(`[ozow] SuccessUrl:         ${resolvedSuccessUrl}`);
+    console.log(`[ozow] NotifyUrl:          ${resolvedNotifyUrl}`);
+    console.log(`[ozow] IsTest:             ${isTest}`);
+    console.log(`[ozow] HashCheck (sha512): ${hashCheck}`);
+    console.log(`[ozow] Hash field count:   ${hashParts.length} parts (incl. privateKey)`);
+    console.log(`[ozow] ═══════════════════════════════════════════════`);
 
     // Return form params — frontend must POST these as a hidden form to https://pay.ozow.com
     return res.json({
