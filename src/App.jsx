@@ -113,6 +113,7 @@ const getTokensFromHash = (hash) => {
 const recoveryTokens = isRecoveryMode ? getTokensFromHash(initialHash) : null;
 
 const mainTabs = ['home', 'credit', 'transact', 'investments', 'markets', 'deposit', 'more', 'welcome', 'auth'];
+const MAIN_TAB_PAGES = new Set(['home', 'credit', 'investments', 'markets', 'deposit', 'more']);
 
 const App = () => {
   const [currentPage, setCurrentPage] = useState(hasError ? "linkExpired" : (isRecoveryMode ? "auth" : "welcome"));
@@ -148,6 +149,7 @@ const App = () => {
   const { refetch: refetchNotifications, reset: resetNotifications } = useNotificationsContext();
   const [showPinLock, setShowPinLock] = useState(false);
   const [showOpenStrategiesMaintenance, setShowOpenStrategiesMaintenance] = useState(false);
+  const [mountedTabs, setMountedTabs] = useState(() => new Set());
 
   const isAuthenticated = !['welcome', 'auth', 'linkExpired'].includes(currentPage);
   const { profile, loading: profileLoading } = useProfile({ enabled: isAuthenticated });
@@ -157,6 +159,17 @@ const App = () => {
   useEffect(() => {
     onboardingRef.current = { complete: onboardingComplete, loading: onboardingLoading };
   }, [onboardingComplete, onboardingLoading]);
+
+  useEffect(() => {
+    if (MAIN_TAB_PAGES.has(currentPage)) {
+      setMountedTabs(prev => {
+        if (prev.has(currentPage)) return prev;
+        const next = new Set(prev);
+        next.add(currentPage);
+        return next;
+      });
+    }
+  }, [currentPage]);
 
   const currentPageRef = useRef(currentPage);
   currentPageRef.current = currentPage;
@@ -1122,65 +1135,89 @@ const App = () => {
   }
 
 
-  if (currentPage === "home") {
+  if (MAIN_TAB_PAGES.has(currentPage)) {
     return (
       <>
-      {showOpenStrategiesMaintenance && <MaintenanceModal onClose={() => setShowOpenStrategiesMaintenance(false)} />}
-      <AppLayout
-        activeTab="home"
-        onTabChange={handleTabChange}
-        onWithdraw={handleWithdrawRequest}
-        onShowComingSoon={handleShowComingSoon}
-        modal={modal}
-        onCloseModal={closeModal}
-      >
-        <HomePage
-          onOpenNotifications={() => {
-            setNotificationReturnPage("home");
-            navigateTo("notifications");
-          }}
-          onOpenMintBalance={() => navigateTo("mintBalance")}
-          onOpenActivity={() => navigateTo("activity")}
-          onOpenActions={() => navigateTo("actions")}
-          onOpenInvestments={() => setCurrentPage("investments")}
-          onOpenCredit={() => setCurrentPage("credit")}
-          onOpenCreditApply={() => navigateTo("creditApply")}
-          onOpenCreditRepay={() => navigateTo("creditRepay")}
-          onOpenInvest={() => { setMarketsInitialView(null); navigateTo("markets"); }}
-          onOpenWithdraw={handleWithdrawRequest}
-          onOpenSettings={() => navigateTo("settings")}
-          onOpenStrategies={() => { setMarketsInitialView("openstrategies"); navigateTo("markets"); }}
-          onOpenMarkets={() => { setMarketsInitialView("invest"); navigateTo("markets"); }}
-          onOpenDeposit={() => handleTabChange("deposit")}
-          onOpenNews={() => { setMarketsInitialView("news"); navigateTo("markets"); }}
-          onOpenNewsArticle={(articleId) => { setSelectedArticleId(articleId); navigateTo("newsArticle"); }}
-          onOpenInstantLiquidity={() => navigateTo("instantLiquidity")}
-          onOpenFamily={() => navigateTo("familyDashboard")}
-          onOpenInsure={() => navigateTo("funeralCover")}
-        />
-      </AppLayout>
+        {showOpenStrategiesMaintenance && <MaintenanceModal onClose={() => setShowOpenStrategiesMaintenance(false)} />}
+        <AppLayout
+          activeTab={currentPage}
+          onTabChange={handleTabChange}
+          onWithdraw={handleWithdrawRequest}
+          onShowComingSoon={handleShowComingSoon}
+          modal={!['markets', 'deposit'].includes(currentPage) ? modal : null}
+          onCloseModal={closeModal}
+        >
+          {mountedTabs.has('home') && (
+            <div style={{ display: currentPage === 'home' ? 'block' : 'none' }}>
+              <HomePage
+                onOpenNotifications={() => { setNotificationReturnPage("home"); navigateTo("notifications"); }}
+                onOpenMintBalance={() => navigateTo("mintBalance")}
+                onOpenActivity={() => navigateTo("activity")}
+                onOpenActions={() => navigateTo("actions")}
+                onOpenInvestments={() => setCurrentPage("investments")}
+                onOpenCredit={() => setCurrentPage("credit")}
+                onOpenCreditApply={() => navigateTo("creditApply")}
+                onOpenCreditRepay={() => navigateTo("creditRepay")}
+                onOpenInvest={() => { setMarketsInitialView(null); navigateTo("markets"); }}
+                onOpenWithdraw={handleWithdrawRequest}
+                onOpenSettings={() => navigateTo("settings")}
+                onOpenStrategies={() => { setMarketsInitialView("openstrategies"); navigateTo("markets"); }}
+                onOpenMarkets={() => { setMarketsInitialView("invest"); navigateTo("markets"); }}
+                onOpenDeposit={() => handleTabChange("deposit")}
+                onOpenNews={() => { setMarketsInitialView("news"); navigateTo("markets"); }}
+                onOpenNewsArticle={(articleId) => { setSelectedArticleId(articleId); navigateTo("newsArticle"); }}
+                onOpenInstantLiquidity={() => navigateTo("instantLiquidity")}
+                onOpenFamily={() => navigateTo("familyDashboard")}
+                onOpenInsure={() => navigateTo("funeralCover")}
+              />
+            </div>
+          )}
+          {mountedTabs.has('credit') && (
+            <div style={{ display: currentPage === 'credit' ? 'block' : 'none' }}>
+              <CreditHome
+                profile={profile}
+                onOpenNotifications={() => { setNotificationReturnPage("credit"); navigateTo("notifications"); }}
+                onTabChange={setCurrentPage}
+              />
+            </div>
+          )}
+          {mountedTabs.has('investments') && (
+            <div style={{ display: currentPage === 'investments' ? 'block' : 'none' }}>
+              <NewPortfolioPage
+                onBack={goBack}
+                onOpenNotifications={() => { setNotificationReturnPage("investments"); navigateTo("notifications"); }}
+                onOpenInvest={() => navigateTo("markets")}
+                onOpenStrategies={() => { setMarketsInitialView("openstrategies"); navigateTo("markets"); }}
+                deepLink={portfolioDeepLink}
+                onDeepLinkConsumed={() => setPortfolioDeepLink(null)}
+              />
+            </div>
+          )}
+          {mountedTabs.has('markets') && (
+            <div style={{ display: currentPage === 'markets' ? 'block' : 'none' }}>
+              <MarketsPage
+                onBack={canSwipeBack ? goBack : undefined}
+                initialViewMode={marketsInitialView}
+                onViewModeChange={(mode) => setMarketsInitialView(mode)}
+                onOpenNotifications={() => { setNotificationReturnPage("markets"); navigateTo("notifications"); }}
+                onOpenStockDetail={(security) => { setSelectedChildForInvest(null); setSelectedSecurity(security); navigateTo("stockDetail"); }}
+                onOpenNewsArticle={(articleId) => { setSelectedArticleId(articleId); navigateTo("newsArticle"); }}
+                onOpenFactsheet={(strategy) => { setSelectedChildForInvest(null); setSelectedStrategy(strategy); navigateTo("factsheet"); }}
+              />
+            </div>
+          )}
+          {mountedTabs.has('deposit') && (
+            <div style={{ display: currentPage === 'deposit' ? 'block' : 'none' }}>
+              <DepositPage onBack={canSwipeBack ? goBack : () => handleTabChange("home")} />
+            </div>
+          )}
+          {mountedTabs.has('more') && (
+            <div style={{ display: currentPage === 'more' ? 'block' : 'none' }}>
+              <MorePage onNavigate={navigateTo} />
+            </div>
+          )}
+        </AppLayout>
       </>
-    );
-  }
-  if (currentPage === "credit") {
-    return (
-      <AppLayout
-        activeTab="credit"
-        onTabChange={handleTabChange}
-        onWithdraw={handleWithdrawRequest}
-        onShowComingSoon={handleShowComingSoon}
-        modal={modal}
-        onCloseModal={closeModal}
-      >
-        <CreditHome
-          profile={profile}
-          onOpenNotifications={() => {
-            setNotificationReturnPage("credit");
-            navigateTo("notifications");
-          }}
-          onTabChange={setCurrentPage}
-        />
-      </AppLayout>
     );
   }
 
@@ -1267,33 +1304,6 @@ const App = () => {
     );
   }
 
-  if (currentPage === "investments") {
-    return (
-      <>
-      {showOpenStrategiesMaintenance && <MaintenanceModal onClose={() => setShowOpenStrategiesMaintenance(false)} />}
-      <AppLayout
-        activeTab="investments"
-        onTabChange={handleTabChange}
-        onWithdraw={handleWithdrawRequest}
-        onShowComingSoon={handleShowComingSoon}
-        modal={modal}
-        onCloseModal={closeModal}
-      >
-        <NewPortfolioPage
-          onBack={goBack}
-          onOpenNotifications={() => {
-            setNotificationReturnPage("investments");
-            navigateTo("notifications");
-          }}
-          onOpenInvest={() => navigateTo("markets")}
-          onOpenStrategies={() => { setMarketsInitialView("openstrategies"); navigateTo("markets"); }}
-          deepLink={portfolioDeepLink}
-          onDeepLinkConsumed={() => setPortfolioDeepLink(null)}
-        />
-      </AppLayout>
-      </>
-    );
-  }
 
   if (currentPage === "invest") {
     return (
@@ -1319,59 +1329,6 @@ const App = () => {
     );
   }
 
-  if (currentPage === "markets") {
-    return (
-      <SwipeBackWrapper onBack={goBack} enabled={canSwipeBack} previousPage={previousPageComponent}>
-        <AppLayout
-          activeTab="markets"
-          onTabChange={handleTabChange}
-          onWithdraw={() => { }}
-          onShowComingSoon={() => { }}
-          modal={null}
-          onCloseModal={() => { }}
-        >
-          <MarketsPage
-            onBack={canSwipeBack ? goBack : undefined}
-            initialViewMode={marketsInitialView}
-            onViewModeChange={(mode) => setMarketsInitialView(mode)}
-            onOpenNotifications={() => {
-              setNotificationReturnPage("markets");
-              navigateTo("notifications");
-            }}
-            onOpenStockDetail={(security) => {
-              setSelectedChildForInvest(null);
-              setSelectedSecurity(security);
-              navigateTo("stockDetail");
-            }}
-            onOpenNewsArticle={(articleId) => {
-              setSelectedArticleId(articleId);
-              navigateTo("newsArticle");
-            }}
-            onOpenFactsheet={(strategy) => {
-              setSelectedChildForInvest(null);
-              setSelectedStrategy(strategy);
-              navigateTo("factsheet");
-            }}
-          />
-        </AppLayout>
-      </SwipeBackWrapper>
-    );
-  }
-
-  if (currentPage === "deposit") {
-    return (
-      <AppLayout
-        activeTab="deposit"
-        onTabChange={handleTabChange}
-        onWithdraw={() => { }}
-        onShowComingSoon={() => { }}
-        modal={null}
-        onCloseModal={() => { }}
-      >
-        <DepositPage onBack={canSwipeBack ? goBack : () => handleTabChange("home")} />
-      </AppLayout>
-    );
-  }
 
   if (currentPage === "stockDetail") {
     return (
@@ -1855,20 +1812,6 @@ const App = () => {
     );
   }
 
-  if (currentPage === "more") {
-    return (
-      <AppLayout
-        activeTab="more"
-        onTabChange={handleTabChange}
-        onWithdraw={handleWithdrawRequest}
-        onShowComingSoon={handleShowComingSoon}
-        modal={modal}
-        onCloseModal={closeModal}
-      >
-        <MorePage onNavigate={navigateTo} />
-      </AppLayout>
-    );
-  }
 
   if (currentPage === "manageSubscriptions") {
     return (
