@@ -55,7 +55,7 @@ function truncateNewsContent(text, maxCharsPerPara = 280, maxParas = 3) {
 
 function buildMintMorningsHtml(articles) {
   const F = `-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Inter,sans-serif`;
-  const LOGO = `https://mfxnghmuccevsxwcetej.supabase.co/storage/v1/object/public/Mint%20Assets/mint-logo.svg`;
+  const LOGO = `https://afjwbujornzwwsjtdwid.supabase.co/storage/v1/object/public/Mint%20Assets/mint-logo.svg`;
 
   const heroArticle = articles[0];
   const heroBody = heroArticle.body_text || heroArticle.body || '';
