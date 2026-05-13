@@ -209,52 +209,7 @@ const HomePage = ({
         return;
       }
 
-      // No direct holdings — rank the underlying securities inside the user's strategy investments.
-      if (strategyHoldings.length > 0) {
-        const securityIds = [...new Set(strategyHoldings.map(h => h.security_id).filter(Boolean))];
-        if (securityIds.length > 0) {
-          const { data: secData } = await supabase
-            .from('securities_c')
-            .select('id, symbol, name, logo_url, last_price, change_percent')
-            .in('id', securityIds);
-          const secMap = Object.fromEntries((secData || []).map(s => [s.id, s]));
-
-          const formatted = strategyHoldings
-            .filter(h => secMap[h.security_id])
-            .map(h => {
-              const sec = secMap[h.security_id];
-              const qty = Number(h.quantity || 0);
-              const avgFill = Number(h.avg_fill || 0);
-              const livePriceCents = sec.last_price != null
-                ? Math.round(Number(sec.last_price) * 100)
-                : avgFill;
-              const marketVal = (livePriceCents * qty) / 100;
-              const costBasis = (avgFill * qty) / 100;
-              const pnlRands = marketVal - costBasis;
-              const pnlPct = costBasis > 0 ? ((pnlRands / costBasis) * 100) : 0;
-              return {
-                symbol: sec.symbol,
-                name: sec.name,
-                logo: sec.logo_url,
-                value: marketVal,
-                change: Number(sec.change_percent) || 0,
-                pnlRands,
-                pnlPct,
-                isPending: !avgFill,
-              };
-            });
-
-          const profitable = formatted.filter(a => !a.isPending && a.pnlPct > 0).sort((a, b) => b.pnlPct - a.pnlPct);
-          const ranked = profitable.slice(0, 5);
-          if (ranked.length > 0) {
-            _cachedBestAssets = ranked;
-            setLocalBestAssets(ranked);
-            return;
-          }
-        }
-      }
-
-      // allocations table removed — skip this fallback gracefully
+      // Only direct individual purchases appear here — strategy holdings are excluded
     } catch (e) {
       console.error("Asset fetch error:", e.message);
     } finally {
