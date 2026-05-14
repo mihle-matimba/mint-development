@@ -226,11 +226,22 @@ async function sendOrderConfirmationEmail(db, { userId, userEmail, assetName, as
   }
 }
 
-const pgPool = (process.env.SUPABASE_DB_URL || process.env.DATABASE_URL) ? new Pool({
-  connectionString: process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  max: 5,
-}) : null;
+function buildPgPool() {
+  const connStr = process.env.SUPABASE_DB_URL || process.env.DATABASE_URL;
+  if (!connStr) return null;
+  try {
+    const u = new URL(connStr);
+    if (!u.hostname || u.hostname === 'base' || u.hostname === 'localhost' && !connStr.includes('@')) {
+      console.warn('[pgPool] SUPABASE_DB_URL appears invalid (hostname: ' + u.hostname + '), skipping pgPool init');
+      return null;
+    }
+    return new Pool({ connectionString: connStr, ssl: { rejectUnauthorized: false }, max: 5 });
+  } catch (e) {
+    console.warn('[pgPool] Could not parse DB connection string:', e.message);
+    return null;
+  }
+}
+const pgPool = buildPgPool();
 
 const app = express();
 app.use(cors());
@@ -1244,63 +1255,6 @@ app.post("/api/sumsub/check-status", async (req, res) => {
   }
 });
 
-async function syncSumsubProfileFields(db, userId, applicant, tag = "") {
-  try {
-    const info = applicant?.info || {};
-    const idDocs = Array.isArray(info?.idDocs) ? info.idDocs : [];
-    const fixedIdDocs = Array.isArray(applicant?.fixedInfo?.idDocs) ? applicant.fixedInfo.idDocs : [];
-    const allIdDocs = [...idDocs, ...fixedIdDocs];
-    const addresses = Array.isArray(info?.addresses) ? info.addresses : [];
-
-    const idCardDoc = allIdDocs.find(d => d?.number) || null;
-    const sumsubIdNumber = idCardDoc?.number ? String(idCardDoc.number).replace(/\D/g, "") : null;
-    const sumsubPhone = applicant?.phone || info?.phone || null;
-    const firstAddress = addresses.find(a => a && (a.formattedAddress || a.street || a.postCode || a.town)) || null;
-    const addressDoc = allIdDocs.find(d => d?.address?.formattedAddress || d?.address?.street || d?.rawAddress) || null;
-    const sumsubAddress =
-      firstAddress?.formattedAddress ||
-      addressDoc?.address?.formattedAddress ||
-      addressDoc?.rawAddress ||
-      [firstAddress?.street, firstAddress?.town, firstAddress?.postCode].filter(Boolean).join(", ") ||
-      null;
-
-    console.log(`[DEBUG sumsub→profiles${tag}] user=${userId} extracted: idNumber=${sumsubIdNumber ? sumsubIdNumber.slice(0,6)+"***" : null} phone=${sumsubPhone ? "[set]" : null} address=${sumsubAddress ? "[set]" : null}`);
-
-    const { data: existingProfile } = await db
-      .from("profiles")
-      .select("id, id_number, phone_number, address")
-      .eq("id", userId)
-      .maybeSingle();
-
-    if (!existingProfile) {
-      console.log(`[DEBUG sumsub→profiles${tag}] no profile row for ${userId}; skipping`);
-      return;
-    }
-
-    const update = {};
-    const existingId = existingProfile.id_number ? String(existingProfile.id_number).replace(/\D/g, "") : "";
-    const isValidSaId = (v) => typeof v === "string" && /^\d{13}$/.test(v);
-    if (sumsubIdNumber && (!existingId || (!isValidSaId(existingId) && isValidSaId(sumsubIdNumber)))) update.id_number = sumsubIdNumber;
-    if (sumsubPhone && !existingProfile.phone_number) update.phone_number = sumsubPhone;
-    if (sumsubAddress && !existingProfile.address) update.address = sumsubAddress;
-
-    if (Object.keys(update).length === 0) {
-      console.log(`[DEBUG sumsub→profiles${tag}] nothing to update for ${userId} (all fields already populated)`);
-      return;
-    }
-
-    const { data: updRows, error: updErr } = await db
-      .from("profiles")
-      .update(update)
-      .eq("id", userId)
-      .select("id");
-    if (updErr) console.error(`[DEBUG sumsub→profiles${tag}] UPDATE FAILED for ${userId}:`, updErr.message);
-    else console.log(`[DEBUG sumsub→profiles${tag}] profiles updated for ${userId} fields=${Object.keys(update).join(",")} rows=${updRows?.length || 0}`);
-  } catch (e) {
-    console.error(`[DEBUG sumsub→profiles${tag}] exception for ${userId}:`, e.message);
-  }
-}
-
 app.post("/api/sumsub/status", async (req, res) => {
   try {
     const { userId } = req.body;
@@ -1312,14 +1266,18 @@ app.post("/api/sumsub/status", async (req, res) => {
       });
     }
 
-    // Optional Bearer auth — if present and valid, enables Sumsub→profiles writeback
+    // Verify caller (used to gate privileged profile writes below). Existing
+    // behavior is preserved for unauthenticated callers — only the new
+    // Sumsub→profiles writeback is gated on a verified token matching userId.
     let authedUserId = null;
-    if (req.headers.authorization?.startsWith("Bearer ")) {
-      const token = req.headers.authorization.replace("Bearer ", "");
-      const { data, error } = await supabase.auth.getUser(token);
-      if (!error && data?.user) authedUserId = data.user.id;
-      else console.log(`[Sumsub] auth header present but invalid for ${userId}: ${error?.message}`);
-    }
+    try {
+      const authHeader = req.headers.authorization || "";
+      const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
+      if (token && supabase) {
+        const { data: authData } = await supabase.auth.getUser(token);
+        if (authData?.user?.id) authedUserId = authData.user.id;
+      }
+    } catch (_) { /* ignore — treated as unauthenticated */ }
 
     const db = supabaseAdmin || supabase;
     if (db) {
@@ -1341,11 +1299,53 @@ app.post("/api/sumsub/status", async (req, res) => {
                 .select("pack_details")
                 .eq("user_id", userId)
                 .maybeSingle();
-              if (packFull?.pack_details) {
-                await syncSumsubProfileFields(db, userId, packFull.pack_details, " short-circuit");
+              const applicant = packFull?.pack_details || {};
+              const info = applicant?.info || {};
+              const idDocs = Array.isArray(info?.idDocs) ? info.idDocs : [];
+              const fixedIdDocs = Array.isArray(applicant?.fixedInfo?.idDocs) ? applicant.fixedInfo.idDocs : [];
+              const allIdDocs = [...idDocs, ...fixedIdDocs];
+              const addresses = Array.isArray(info?.addresses) ? info.addresses : [];
+
+              const idCardDoc = allIdDocs.find(d => d?.number) || null;
+              const sumsubIdNumber = idCardDoc?.number ? String(idCardDoc.number).replace(/\D/g, "") : null;
+              const sumsubPhone = applicant?.phone || info?.phone || null;
+              const firstAddress = addresses.find(a => a && (a.formattedAddress || a.street || a.postCode || a.town)) || null;
+              const addressDoc = allIdDocs.find(d => d?.address?.formattedAddress || d?.address?.street || d?.rawAddress) || null;
+              const sumsubAddress =
+                firstAddress?.formattedAddress ||
+                addressDoc?.address?.formattedAddress ||
+                addressDoc?.rawAddress ||
+                [firstAddress?.street, firstAddress?.town, firstAddress?.postCode].filter(Boolean).join(", ") ||
+                null;
+
+              console.log(`[DEBUG sumsub→profiles short-circuit] user=${userId} extracted: idNumber=${sumsubIdNumber ? sumsubIdNumber.slice(0,6)+"***" : null} phone=${sumsubPhone ? "[set]" : null} address=${sumsubAddress ? "[set]" : null}`);
+
+              const { data: existingProfile } = await db
+                .from("profiles")
+                .select("id, id_number, phone_number, address")
+                .eq("id", userId)
+                .maybeSingle();
+
+              const profileUpdate = {};
+              const existingId = existingProfile?.id_number ? String(existingProfile.id_number).replace(/\D/g, "") : "";
+              const isValidSaId = (v) => typeof v === "string" && /^\d{13}$/.test(v);
+              if (sumsubIdNumber && (!existingId || (!isValidSaId(existingId) && isValidSaId(sumsubIdNumber)))) profileUpdate.id_number = sumsubIdNumber;
+              if (sumsubPhone && !existingProfile?.phone_number) profileUpdate.phone_number = sumsubPhone;
+              if (sumsubAddress && !existingProfile?.address) profileUpdate.address = sumsubAddress;
+
+              if (Object.keys(profileUpdate).length > 0 && existingProfile) {
+                const { data: updRows, error: updErr } = await db
+                  .from("profiles")
+                  .update(profileUpdate)
+                  .eq("id", userId)
+                  .select("id");
+                if (updErr) console.error(`[DEBUG sumsub→profiles short-circuit] UPDATE FAILED for ${userId}:`, updErr.message);
+                else console.log(`[DEBUG sumsub→profiles short-circuit] profiles updated for ${userId} fields=${Object.keys(profileUpdate).join(",")} rows=${updRows?.length || 0}`);
+              } else {
+                console.log(`[DEBUG sumsub→profiles short-circuit] no fields to update for ${userId}. existing:`, { hasId: !!existingProfile?.id_number, hasPhone: !!existingProfile?.phone_number, hasAddress: !!existingProfile?.address });
               }
-            } catch (e) {
-              console.error(`[DEBUG sumsub→profiles short-circuit] failed loading pack for ${userId}:`, e.message);
+            } catch (syncErr) {
+              console.error(`[DEBUG sumsub→profiles short-circuit] exception for ${userId}:`, syncErr.message);
             }
           } else {
             console.log(`[DEBUG sumsub→profiles short-circuit] skipping for ${userId} — caller not authenticated as this user (authedUserId=${authedUserId || "none"})`);
@@ -1468,13 +1468,6 @@ app.post("/api/sumsub/status", async (req, res) => {
             console.log(`[Status] Created user_onboarding_pack_details for user ${userId}`);
           }
 
-          // Sumsub → profiles writeback (id_number, phone_number, address) — gated on auth
-          if (authedUserId === userId) {
-            await syncSumsubProfileFields(db, userId, applicant, "");
-          } else {
-            console.log(`[DEBUG sumsub→profiles] skipping for ${userId} — caller not authenticated as this user (authedUserId=${authedUserId || "none"})`);
-          }
-
           const onboardingUpdate = {
             sumsub_external_user_id: userId,
             sumsub_applicant_id: applicant.id,
@@ -1524,6 +1517,84 @@ app.post("/api/sumsub/status", async (req, res) => {
           } else {
             await db.from("required_actions").insert({ user_id: userId, kyc_verified: true, kyc_pending: false, kyc_needs_resubmission: false });
           }
+
+          // === Sumsub → profiles writeback (id_number, phone_number, address) ===
+          // SECURITY: only when the caller has proven (via Bearer token) they ARE this user.
+          if (authedUserId !== userId) {
+            console.log(`[DEBUG sumsub→profiles] skipping profile writeback for ${userId} — caller not authenticated as this user (authedUserId=${authedUserId || "none"})`);
+          } else
+          try {
+            const info = applicant?.info || {};
+            const idDocs = Array.isArray(info?.idDocs) ? info.idDocs : [];
+            const fixedIdDocs = Array.isArray(applicant?.fixedInfo?.idDocs) ? applicant.fixedInfo.idDocs : [];
+            const allIdDocs = [...idDocs, ...fixedIdDocs];
+            const addresses = Array.isArray(info?.addresses) ? info.addresses : [];
+
+            const idCardDoc = allIdDocs.find(d => d?.number) || null;
+            const sumsubIdNumber = idCardDoc?.number ? String(idCardDoc.number).replace(/\D/g, "") : null;
+
+            const sumsubPhone = applicant?.phone || info?.phone || null;
+
+            const firstAddress = addresses.find(a => a && (a.formattedAddress || a.street || a.postCode || a.town)) || null;
+            const addressDoc = allIdDocs.find(d => d?.address?.formattedAddress || d?.address?.street || d?.rawAddress) || null;
+            const sumsubAddress =
+              firstAddress?.formattedAddress ||
+              addressDoc?.address?.formattedAddress ||
+              addressDoc?.rawAddress ||
+              [firstAddress?.street, firstAddress?.town, firstAddress?.postCode].filter(Boolean).join(", ") ||
+              null;
+
+            console.log(`[DEBUG sumsub→profiles] user=${userId} extracted: idNumber=${sumsubIdNumber ? sumsubIdNumber.slice(0,6)+"***" : null} phone=${sumsubPhone ? "[set]" : null} address=${sumsubAddress ? "[set]" : null} (idDocs=${allIdDocs.length} addresses=${addresses.length})`);
+
+            const { data: existingProfile, error: profLookupErr } = await db
+              .from("profiles")
+              .select("id, id_number, phone_number, address")
+              .eq("id", userId)
+              .maybeSingle();
+
+            if (profLookupErr) {
+              console.error(`[DEBUG sumsub→profiles] profile lookup error for ${userId}:`, profLookupErr.message);
+            }
+
+            const profileUpdate = {};
+            // ID rule: never overwrite a non-empty existing id_number unless the new one is a valid 13-digit SA ID and the existing one is not.
+            const existingId = existingProfile?.id_number ? String(existingProfile.id_number).replace(/\D/g, "") : "";
+            const isValidSaId = (v) => typeof v === "string" && /^\d{13}$/.test(v);
+            if (sumsubIdNumber && (!existingId || (!isValidSaId(existingId) && isValidSaId(sumsubIdNumber)))) {
+              profileUpdate.id_number = sumsubIdNumber;
+            }
+            if (sumsubPhone && !existingProfile?.phone_number) profileUpdate.phone_number = sumsubPhone;
+            if (sumsubAddress && !existingProfile?.address) profileUpdate.address = sumsubAddress;
+
+            if (Object.keys(profileUpdate).length > 0) {
+              if (existingProfile) {
+                const { data: updRows, error: updErr } = await db
+                  .from("profiles")
+                  .update(profileUpdate)
+                  .eq("id", userId)
+                  .select("id");
+                if (updErr) {
+                  console.error(`[DEBUG sumsub→profiles] PROFILES UPDATE FAILED for ${userId}:`, updErr.message, "fields:", Object.keys(profileUpdate));
+                } else {
+                  console.log(`[DEBUG sumsub→profiles] profiles updated for ${userId} fields=${Object.keys(profileUpdate).join(",")} rows=${updRows?.length || 0}`);
+                }
+              } else {
+                const { error: insErr } = await db
+                  .from("profiles")
+                  .insert({ id: userId, ...profileUpdate });
+                if (insErr) {
+                  console.error(`[DEBUG sumsub→profiles] PROFILES INSERT FAILED for ${userId}:`, insErr.message);
+                } else {
+                  console.log(`[DEBUG sumsub→profiles] profiles inserted for ${userId} fields=${Object.keys(profileUpdate).join(",")}`);
+                }
+              }
+            } else {
+              console.log(`[DEBUG sumsub→profiles] no fields to update for ${userId} — either nothing in pack or profile already populated. existing:`, { hasId: !!existingProfile?.id_number, hasPhone: !!existingProfile?.phone_number, hasAddress: !!existingProfile?.address });
+            }
+          } catch (syncErr) {
+            console.error(`[DEBUG sumsub→profiles] sync exception for ${userId}:`, syncErr.message, syncErr.stack);
+          }
+          // === end Sumsub → profiles writeback ===
         } catch (dbErr) {
           console.error(`[Status] Error updating onboarding for ${userId}:`, dbErr.message);
         }
@@ -3180,19 +3251,7 @@ app.post("/api/record-investment", async (req, res) => {
       const secBySymbol = {};
       (securitiesData || []).forEach(s => { secBySymbol[s.symbol] = s; });
 
-      // Compute total basket cost at current prices so we can scale by investAmount
-      let totalBasketCostRands = 0;
-      for (const holding of strategyHoldings) {
-        const sec = secBySymbol[holding.symbol];
-        if (!sec) continue;
-        const qty = Number(holding.quantity || holding.shares || 0);
-        const priceCents = Number(sec.last_price || 0);
-        if (qty > 0 && priceCents > 0) totalBasketCostRands += (qty * priceCents) / 100;
-      }
-      // investAmount is how much the user actually put in (before fees)
-      const scalingRatio = totalBasketCostRands > 0 ? investAmount / totalBasketCostRands : 1;
-      console.log("[record-investment] Basket cost:", totalBasketCostRands.toFixed(2), "investAmount:", investAmount, "scalingRatio:", scalingRatio.toFixed(6));
-
+      // Quantities come straight from strategies_c.holdings — do NOT scale by investAmount.
       const now = new Date().toISOString();
       const today = now.split("T")[0];
       const insertedHoldings = [];
@@ -3213,8 +3272,8 @@ app.post("/api/record-investment", async (req, res) => {
           continue;
         }
 
-        // Scale shares proportionally to what the user actually invested — always whole shares
-        const holdingQty = Math.max(1, Math.round(rawHoldingQty * scalingRatio));
+        // Use the exact quantity from strategies_c.holdings — no scaling.
+        const holdingQty = Math.floor(rawHoldingQty);
 
         const priceCents = Number(sec.last_price || 0);
         if (priceCents <= 0) {
@@ -3262,18 +3321,15 @@ app.post("/api/record-investment", async (req, res) => {
         }
 
         if (existing) {
-          const oldQty = Number(existing.quantity || 0);
-          const newQty = Math.round(oldQty + holdingQty);
-          const oldAvgFill = Number(existing.avg_fill || 0);
-          const newAvgFill = oldQty > 0 && oldAvgFill > 0
-            ? Math.round((oldAvgFill * oldQty + priceCents * holdingQty) / newQty)
-            : priceCents;
+          // Do not accumulate: quantity is the value from strategies_c.holdings, not a running total.
+          // Do not set avg_fill on buy — leave it for the fill/settlement process.
+          const newQty = holdingQty;
 
           const { error: updateErr } = await db.from("stock_holdings_c").update({
             quantity: newQty,
-            avg_fill: newAvgFill,
-            market_value: Math.round(newQty * priceCents),
-            as_of_date: today,
+            avg_fill: null,
+            market_value: 0,
+            as_of_date: null,
             updated_at: now,
           }).eq("id", existing.id);
 
@@ -3281,7 +3337,7 @@ app.post("/api/record-investment", async (req, res) => {
             console.error("[record-investment] Failed to update holding for", holding.symbol, updateErr.message);
             return res.status(500).json({ success: false, error: `Failed to update holding for ${holding.symbol}` });
           }
-          console.log("[record-investment] Updated holding:", holding.symbol, "qty:", newQty, "avg_fill:", newAvgFill);
+          console.log("[record-investment] Updated holding:", holding.symbol, "qty:", newQty, "avg_fill: null");
         } else {
           const { error: insertErr } = await db.from("stock_holdings_c").insert({
             user_id: targetUserId,
@@ -3289,10 +3345,10 @@ app.post("/api/record-investment", async (req, res) => {
             security_id: sec.id,
             strategy_id: strategyId,
             quantity: holdingQty,
-            avg_fill: priceCents,
-            market_value: Math.round(holdingQty * priceCents),
+            avg_fill: null,
+            market_value: 0,
             unrealized_pnl: 0,
-            as_of_date: today,
+            as_of_date: null,
             Status: "active",
           });
 
@@ -3300,7 +3356,7 @@ app.post("/api/record-investment", async (req, res) => {
             console.error("[record-investment] Failed to insert holding for", holding.symbol, insertErr.message);
             return res.status(500).json({ success: false, error: `Failed to record holding for ${holding.symbol}` });
           }
-          console.log("[record-investment] Inserted holding:", holding.symbol, "qty:", holdingQty, "avg_fill:", priceCents);
+          console.log("[record-investment] Inserted holding:", holding.symbol, "qty:", holdingQty, "avg_fill: null");
         }
 
         insertedHoldings.push({ symbol: holding.symbol, quantity: holdingQty, priceCents });
@@ -3788,31 +3844,18 @@ app.post("/api/confirm-eft-deposit", async (req, res) => {
         const { data: securitiesData } = await db.from("securities_c").select("id, symbol, last_price").in("symbol", symbols);
         const secBySymbol = {};
         (securitiesData || []).forEach(s => { secBySymbol[s.symbol] = s; });
-        let totalBasketCostRands = 0;
-        for (const h of strategyData.holdings) {
-          const sec = secBySymbol[h.symbol];
-          if (!sec) continue;
-          const qty = Number(h.quantity || h.shares || 0);
-          const pc = Number(sec.last_price || 0);
-          if (qty > 0 && pc > 0) totalBasketCostRands += (qty * pc) / 100;
-        }
-        const scalingRatio = totalBasketCostRands > 0 ? investAmount / totalBasketCostRands : 1;
+        // Quantity comes straight from strategies_c.holdings — no scaling, no avg_fill on buy.
         for (const h of strategyData.holdings) {
           const sec = secBySymbol[h.symbol];
           if (!sec) continue;
           const rawQty = Number(h.quantity || h.shares || 0);
           if (rawQty <= 0) continue;
-          const holdingQty = rawQty * scalingRatio;
-          const pc = Number(sec.last_price || 0);
-          if (pc <= 0) continue;
-          const { data: existing } = await db.from("stock_holdings_c").select("id, quantity, avg_fill").eq("user_id", userId).eq("security_id", sec.id).eq("strategy_id", strategyId).maybeSingle();
+          const holdingQty = Math.floor(rawQty);
+          const { data: existing } = await db.from("stock_holdings_c").select("id").eq("user_id", userId).eq("security_id", sec.id).eq("strategy_id", strategyId).maybeSingle();
           if (existing) {
-            const oldQty = Number(existing.quantity || 0);
-            const newQty = oldQty + holdingQty;
-            const newAvg = newQty > 0 ? ((Number(existing.avg_fill || 0) * oldQty) + (pc * holdingQty)) / newQty : pc;
-            await db.from("stock_holdings_c").update({ quantity: newQty, avg_fill: Math.round(newAvg), market_value: Math.round(newQty * pc), as_of_date: today, updated_at: now }).eq("id", existing.id);
+            await db.from("stock_holdings_c").update({ quantity: holdingQty, avg_fill: null, market_value: 0, as_of_date: null, updated_at: now }).eq("id", existing.id);
           } else {
-            await db.from("stock_holdings_c").insert({ user_id: userId, security_id: sec.id, strategy_id: strategyId, quantity: holdingQty, avg_fill: pc, market_value: Math.round(holdingQty * pc), unrealized_pnl: 0, as_of_date: today, Status: "active" });
+            await db.from("stock_holdings_c").insert({ user_id: userId, security_id: sec.id, strategy_id: strategyId, quantity: holdingQty, avg_fill: null, market_value: 0, unrealized_pnl: 0, as_of_date: null, Status: "active" });
           }
         }
 
@@ -4333,6 +4376,22 @@ app.get("/api/user/strategies", async (req, res) => {
     const holdingStrategyIds = [...new Set((userStratHoldings || []).map(h => h.strategy_id).filter(Boolean))];
     console.log("[user/strategies] Holdings with strategy_id found:", (userStratHoldings || []).length, "unique strategy IDs:", holdingStrategyIds);
 
+    // Fetch latest client_strategy_returns_c row per strategy for this user.
+    // basket_value (cents) is the displayed price; 1d_pct is the displayed change %.
+    const latestReturnsByStrategy = {};
+    if (holdingStrategyIds.length > 0) {
+      const { data: returnsRows, error: retErr } = await db
+        .from("client_strategy_returns_c")
+        .select("strategy_id, as_of_date, basket_value, \"1d_pct\", \"1d_pnl\", ytd_pct, inception_pct")
+        .eq("user_id", userId)
+        .in("strategy_id", holdingStrategyIds)
+        .order("as_of_date", { ascending: false });
+      if (retErr) console.warn("[user/strategies] client_strategy_returns_c error:", retErr.message);
+      for (const r of (returnsRows || [])) {
+        if (!latestReturnsByStrategy[r.strategy_id]) latestReturnsByStrategy[r.strategy_id] = r;
+      }
+    }
+
     if (strategyNames.length === 0 && holdingStrategyIds.length === 0) {
       console.log("[user/strategies] No strategy names or holdings found — returning empty.");
       return res.status(200).json({ success: true, strategies: [] });
@@ -4362,12 +4421,19 @@ app.get("/api/user/strategies", async (req, res) => {
         const qty = Number(h.quantity || 0);
         const avgFill = Number(h.avg_fill || 0);
         if (!avgFill) continue;
-        const livePrice = (sec.last_price != null) ? (sec.last_price) : (avgFill / 100);
+        const livePrice = (sec.last_price != null) ? (sec.last_price) : avgFill;
+        // Detect format: if avgFill >> livePrice, avgFill is in cents and qty is actual basket qty.
+        // Otherwise avgFill ≈ livePrice (both rands) and qty is 100× scaled.
+        const avgFillIsInCents = livePrice > 0 && (avgFill / livePrice) > 20;
         symbolPnlMap[sec.symbol] = {
-          pnlRands: (livePrice - (avgFill / 100)) * qty,
-          pnlPct: avgFill > 0 ? ((livePrice - (avgFill / 100)) / (avgFill / 100)) * 100 : 0,
-          currentValue: (livePrice * qty) * 100, // Send as cents
-          costBasis: (avgFill * qty), // avgFill is already cents
+          pnlRands: avgFillIsInCents
+            ? (livePrice - avgFill / 100) * qty
+            : ((livePrice - avgFill) * qty) / 100,
+          pnlPct: avgFillIsInCents
+            ? (avgFill > 0 ? ((livePrice - avgFill / 100) / (avgFill / 100)) * 100 : 0)
+            : (avgFill > 0 ? ((livePrice - avgFill) / avgFill) * 100 : 0),
+          currentValue: avgFillIsInCents ? livePrice * qty * 100 : livePrice * qty,
+          costBasis: avgFill * qty,
         };
       }
     }
@@ -4453,13 +4519,17 @@ app.get("/api/user/strategies", async (req, res) => {
       );
       const matchedByHoldings = holdingStrategyIds.includes(strategy.id);
 
-      if (matchKey || matchedByHoldings) {
+      // Only show strategies that still have active holdings in stock_holdings_c.
+      // Transaction-name matches alone (without holdings) are stale ghosts from deleted/legacy data.
+      if (matchedByHoldings) {
         const metrics = strategy.strategy_metrics;
         const latestMetric = Array.isArray(metrics) ? metrics[0] : metrics;
         const enrichedHoldings = (strategy.holdings || []).map(h => {
           const pnlData = symbolPnlMap[h.symbol] || null;
+          // Use the quantity from strategies_c.holdings JSONB as the share count.
           return {
             ...h,
+            shares: h.quantity != null ? h.quantity : h.shares,
             logo_url: h.logo_url || securitiesMap[h.symbol]?.logo_url || null,
             name: h.name || securitiesMap[h.symbol]?.name || h.symbol,
             pnlRands: pnlData ? pnlData.pnlRands : null,
@@ -4468,37 +4538,16 @@ app.get("/api/user/strategies", async (req, res) => {
             costBasis: pnlData ? pnlData.costBasis : null,
           };
         });
-        const stratHoldings = stratHoldingsByStratId[strategy.id] || [];
-        let investedAmount = 0;
-        let currentMarketValue = 0;
-        const allPending = stratHoldings.length > 0 && stratHoldings.every(h => !h.avg_fill);
-        if (stratHoldings.length === 0) {
-          // No holdings allocated yet — compute invested amount from transactions
-          for (const tx of (transactions || [])) {
-            const txName = (tx.name || "").trim();
-            let txStratName = null;
-            if (txName.startsWith("Strategy Investment: ")) txStratName = txName.replace("Strategy Investment: ", "").trim();
-            else if (txName.startsWith("Purchased ")) txStratName = txName.replace("Purchased ", "").trim();
-            if (txStratName && (
-              txStratName.toLowerCase() === (strategy.name || "").toLowerCase() ||
-              txStratName.toLowerCase() === (strategy.short_name || "").toLowerCase()
-            )) {
-              investedAmount += Number(tx.amount || 0) / 100;
-            }
-          }
-          currentMarketValue = investedAmount;
-        } else if (!allPending) {
-          for (const h of stratHoldings) {
-            const qty = Number(h.quantity || 0);
-            const avgFill = Number(h.avg_fill || 0);
-            if (!avgFill) continue;
-            const livePrice = stratLivePriceMap[h.security_id] || (avgFill / 100);
-            const marketVal = (livePrice * qty); // In Rands
-            console.log(`[user/strategies] Holding: ${h.security_id}, Price: ${livePrice}, Qty: ${qty}, Value: R${marketVal}`);
-            investedAmount += (avgFill * qty) / 100;
-            currentMarketValue += marketVal;
-          }
-        }
+        // Price + change % come from client_strategy_returns_c (latest as_of_date for this user/strategy).
+        // basket_value is in cents → convert to rands. 1d_pct is the change percentage.
+        const latestReturn = latestReturnsByStrategy[strategy.id];
+        const basketValueRands = latestReturn?.basket_value != null
+          ? Number(latestReturn.basket_value) / 100
+          : 0;
+        const investedAmount = basketValueRands;
+        const currentMarketValue = basketValueRands;
+        const changePct = latestReturn?.["1d_pct"] != null ? Number(latestReturn["1d_pct"]) : 0;
+        const oneDayPnlRands = latestReturn?.["1d_pnl"] != null ? Number(latestReturn["1d_pnl"]) : 0;
 
         // Calculate dynamic YTD if utility is available
         let rytd = latestMetric?.r_ytd_pct ?? latestMetric?.r_ytd ?? 0;
@@ -4521,9 +4570,11 @@ app.get("/api/user/strategies", async (req, res) => {
           imageUrl: strategy.image_url,
           isKidStrategy: !!strategy.is_kid_strategy,
           holdings: enrichedHoldings,
-          investedAmount: investedAmount, // Return as Rands
-          currentMarketValue: currentMarketValue, // Return as Rands
-          currentValue: currentMarketValue, // Return as Rands
+          investedAmount: investedAmount, // Return as Rands (basket_value/100 from client_strategy_returns_c)
+          currentMarketValue: currentMarketValue, // Same as investedAmount
+          currentValue: currentMarketValue,
+          changePct: changePct, // 1d_pct from client_strategy_returns_c
+          oneDayPnlRands: oneDayPnlRands, // 1d_pnl from client_strategy_returns_c
           metrics: latestMetric ? { ...latestMetric, r_ytd: rytd } : { r_ytd: rytd },
           firstInvestedDate: strategyFirstDate[matchKey] || null,
         });
@@ -6759,47 +6810,30 @@ app.post("/api/ozow/record-success", async (req, res) => {
       const secBySymbol = {};
       (securitiesData || []).forEach(s => { secBySymbol[s.symbol] = s; });
 
-      let totalBasketCostRands = 0;
-      for (const holding of strategyHoldings) {
-        const sec = secBySymbol[holding.symbol];
-        if (!sec) continue;
-        const qty = Number(holding.quantity || holding.shares || 0);
-        const priceCents = Number(sec.last_price || 0);
-        if (qty > 0 && priceCents > 0) totalBasketCostRands += (qty * priceCents) / 100;
-      }
-
-      const scalingRatio = totalBasketCostRands > 0 ? amountZAR / totalBasketCostRands : 1;
       const now = new Date().toISOString();
-      const today = now.split("T")[0];
 
+      // Quantity comes straight from strategies_c.holdings — no scaling, no avg_fill on buy.
       for (const holding of strategyHoldings) {
         const sec = secBySymbol[holding.symbol];
         if (!sec) continue;
         const rawQty = Number(holding.quantity || holding.shares || 0);
         if (rawQty <= 0) continue;
-        const priceCents = Number(sec.last_price || 0);
-        if (priceCents <= 0) continue;
-
-        const holdingQty = rawQty * scalingRatio;
+        const holdingQty = Math.floor(rawQty);
 
         const { data: existing } = await db
           .from("stock_holdings_c")
-          .select("id, quantity, avg_fill")
+          .select("id")
           .eq("user_id", userId)
           .eq("security_id", sec.id)
           .eq("strategy_id", strategyId)
           .maybeSingle();
 
         if (existing) {
-          const oldQty = Number(existing.quantity || 0);
-          const oldAvgFill = Number(existing.avg_fill || 0);
-          const newQty = oldQty + holdingQty;
-          const newAvgFill = newQty > 0 ? ((oldAvgFill * oldQty) + (priceCents * holdingQty)) / newQty : priceCents;
           await db.from("stock_holdings_c").update({
-            quantity: newQty,
-            avg_fill: Math.round(newAvgFill),
-            market_value: Math.round(newQty * priceCents),
-            as_of_date: today,
+            quantity: holdingQty,
+            avg_fill: null,
+            market_value: 0,
+            as_of_date: null,
             updated_at: now,
           }).eq("id", existing.id);
         } else {
@@ -6808,10 +6842,10 @@ app.post("/api/ozow/record-success", async (req, res) => {
             security_id: sec.id,
             strategy_id: strategyId,
             quantity: holdingQty,
-            avg_fill: priceCents,
-            market_value: Math.round(holdingQty * priceCents),
+            avg_fill: null,
+            market_value: 0,
             unrealized_pnl: 0,
-            as_of_date: today,
+            as_of_date: null,
             Status: "active",
           });
         }
@@ -6950,61 +6984,43 @@ app.post("/api/ozow/notify", async (req, res) => {
         const secBySymbol = {};
         (securitiesData || []).forEach(s => { secBySymbol[s.symbol] = s; });
 
-        // Compute total basket cost to derive scaling ratio
-        let totalBasketCostRands = 0;
-        for (const holding of strategyHoldings) {
-          const sec = secBySymbol[holding.symbol];
-          if (!sec) continue;
-          const qty = Number(holding.quantity || holding.shares || 0);
-          const priceCents = Number(sec.last_price || 0);
-          if (qty > 0 && priceCents > 0) totalBasketCostRands += (qty * priceCents) / 100;
-        }
-
-        const scalingRatio = totalBasketCostRands > 0 ? amountZAR / totalBasketCostRands : 1;
         const now = new Date().toISOString();
-        const today = now.split("T")[0];
 
+        // Quantity comes straight from strategies_c.holdings — no scaling, no avg_fill on buy.
         for (const holding of strategyHoldings) {
           const sec = secBySymbol[holding.symbol];
           if (!sec) continue;
           const rawQty = Number(holding.quantity || holding.shares || 0);
           if (rawQty <= 0) continue;
-          const priceCents = Number(sec.last_price || 0);
-          if (priceCents <= 0) continue;
-
-          const holdingQty = rawQty * scalingRatio;
+          const holdingQty = Math.floor(rawQty);
 
           const { data: existing } = await db
             .from("stock_holdings_c")
-            .select("id, quantity, avg_fill")
+            .select("id")
             .eq("user_id", userId)
             .eq("security_id", sec.id)
             .eq("strategy_id", strategyId)
             .maybeSingle();
 
           if (existing) {
-            const oldQty = Number(existing.quantity || 0);
-            const oldAvgFill = Number(existing.avg_fill || 0);
-            const newQty = oldQty + holdingQty;
-            const newAvgFill = newQty > 0 ? ((oldAvgFill * oldQty) + (priceCents * holdingQty)) / newQty : priceCents;
             await db.from("stock_holdings_c").update({
-              quantity: newQty,
-              avg_fill: Math.round(newAvgFill),
-              market_value: Math.round(newQty * priceCents),
-              as_of_date: today,
+              quantity: holdingQty,
+              avg_fill: null,
+              market_value: 0,
+              as_of_date: null,
               updated_at: now,
             }).eq("id", existing.id);
-            console.log(`[ozow/notify] Updated holding ${holding.symbol} qty=${newQty}`);
+            console.log(`[ozow/notify] Updated holding ${holding.symbol} qty=${holdingQty}`);
           } else {
             await db.from("stock_holdings_c").insert({
               user_id: userId,
               security_id: sec.id,
               strategy_id: strategyId,
               quantity: holdingQty,
-              avg_fill: priceCents,
-              market_value: Math.round(holdingQty * priceCents),
+              avg_fill: null,
+              market_value: 0,
               unrealized_pnl: 0,
-              as_of_date: today,
+              as_of_date: null,
               Status: "active",
             });
             console.log(`[ozow/notify] Inserted holding ${holding.symbol} qty=${holdingQty}`);
@@ -8117,49 +8133,55 @@ app.post('/api/child-invest', async (req, res) => {
       const symbols = holdings.map(h => h.symbol).filter(Boolean);
       const { data: securities } = await db
         .from('securities_c')
-        .select('id, symbol, name, last_price')
+        .select('id, symbol, name')
         .in('symbol', symbols);
 
       const secMap = {};
       (securities || []).forEach(s => { secMap[s.symbol] = s; });
 
-      let totalBasketCostRands = 0;
+      // Quantity comes straight from strategies_c.holdings — no scaling, no avg_fill on buy.
       for (const h of holdings) {
         const sec = secMap[h.symbol];
-        if (sec?.last_price) {
-          totalBasketCostRands += sec.last_price * (h.weight || 1);
-        }
-      }
+        if (!sec) continue;
 
-      if (totalBasketCostRands > 0) {
-        const scale = investAmountRands / totalBasketCostRands;
+        const qty = Math.floor(Number(h.quantity || h.shares || 0));
+        if (qty <= 0) continue;
 
-        for (const h of holdings) {
-          const sec = secMap[h.symbol];
-          if (!sec?.last_price) continue;
+        try {
+          const { data: existing } = await db
+            .from('stock_holdings_c')
+            .select('id')
+            .eq('user_id', parentUserId)
+            .eq('family_member_id', family_member_id)
+            .eq('security_id', sec.id)
+            .eq('strategy_id', strategy_id)
+            .maybeSingle();
 
-          const qty = Math.floor((h.weight || 1) * scale);
-          if (qty <= 0) continue;
-
-          try {
-            await db
-              .from('stock_holdings_c')
-              .insert({
-                user_id: parentUserId,
-                family_member_id: family_member_id,
-                security_id: sec.id,
-                quantity: qty,
-                avg_fill: null,
-                market_value: 0,
-                unrealized_pnl: 0,
-                as_of_date: null,
-                strategy_id: strategy_id,
-                Status: 'active',
-              });
-            holdingsCreated++;
-          } catch (e) {
-            console.warn(`[child-invest] pending holding insert for ${h.symbol}:`, e.message);
+          if (existing) {
+            await db.from('stock_holdings_c').update({
+              quantity: qty,
+              avg_fill: null,
+              market_value: 0,
+              as_of_date: null,
+              updated_at: new Date().toISOString(),
+            }).eq('id', existing.id);
+          } else {
+            await db.from('stock_holdings_c').insert({
+              user_id: parentUserId,
+              family_member_id: family_member_id,
+              security_id: sec.id,
+              quantity: qty,
+              avg_fill: null,
+              market_value: 0,
+              unrealized_pnl: 0,
+              as_of_date: null,
+              strategy_id: strategy_id,
+              Status: 'active',
+            });
           }
+          holdingsCreated++;
+        } catch (e) {
+          console.warn(`[child-invest] pending holding upsert for ${h.symbol}:`, e.message);
         }
       }
     }

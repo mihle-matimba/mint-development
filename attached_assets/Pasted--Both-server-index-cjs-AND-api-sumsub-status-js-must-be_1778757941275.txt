@@ -1,0 +1,166 @@
+⚠️ Both server/index.cjs AND api/sumsub/status.js must be deployed. The Express version runs locally; the Vercel version runs in production. They are functionally equivalent and both received the same fix.
+
+🧠 The problem we fixed (one-line summary)
+During onboarding, address, ID number, tax, bank, mandate, etc. were saved correctly to user_onboarding. But profiles.phone_number, profiles.id_number, and profiles.address were not being populated from the data Sumsub captured during KYC. Phone in particular was never collected anywhere except inside Sumsub, so it never made it into profiles.
+
+The root cause was that the Sumsub status endpoint never copied data from the Sumsub applicant record back into profiles. We added that copy ("writeback"), but had to handle three sub-issues to make it actually fire:
+
+Authorization — server can't trust a random caller saying "update user X's profile", so we gated the writeback on a verified Bearer token where authedUserId === userId.
+Frontend wasn't sending the token — the polling hooks were calling the status endpoint anonymously, so the gate always rejected them.
+Already-verified users took an early exit path — if the KYC pack was already stored in user_onboarding_pack_details, the route returned {status: "verified"} immediately and skipped the writeback entirely. We had to add the writeback to that early-return path too.
+📄 File 1: server/index.cjs (local Express server — ~lines 1261–1620)
+What this file is
+The local Express server that runs via npm run dev (node server/index.cjs). It mirrors the Vercel api/ handlers but in one big file. During local development, all /api/* calls hit this server.
+
+What we changed
+Change A — Optional Bearer auth at the top of /api/sumsub/status (~line 1272)
+
+Before the route does anything, it checks for an Authorization: Bearer <jwt> header. If present, it validates the JWT against Supabase and stores the result in authedUserId. If absent or invalid, authedUserId stays null — the route still works for anonymous callers (so we don't break webhook flows or anything else), but the writeback is skipped.
+
+let authedUserId = null;
+if (req.headers.authorization?.startsWith("Bearer ")) {
+  const token = req.headers.authorization.replace("Bearer ", "");
+  const { data, error } = await supabase.auth.getUser(token);
+  if (!error && data?.user) authedUserId = data.user.id;
+}
+
+Change B — Sumsub→profiles writeback in the GREEN handler (~line 1463)
+
+When Sumsub returns a fresh GREEN verdict (i.e., the user just finished KYC), after we store the pack into user_onboarding_pack_details, we now also extract id_number, phone_number, and address from the applicant payload and update profiles — but only filling blanks (we never overwrite data the user typed in). Gated on authedUserId === userId.
+
+Change C — Same writeback in the early-return short-circuit (~line 1294)
+
+When user_onboarding_pack_details already has a row for this user, the route used to return immediately. We now load the stored pack from that row, run the same writeback on it, then return. This is what makes the fix work for users who already completed KYC before this fix shipped (like Lindelwa).
+
+Change D — Tightened ID overwrite rule
+
+id_number is only overwritten if the existing value isn't a valid 13-digit SA ID (so we never clobber a manually entered correct ID with garbage from Sumsub).
+
+How to integrate
+Just paste in the new version of these three regions. Search for these markers to locate them:
+
+// Optional Bearer auth (the auth block at top of route)
+[DEBUG sumsub→profiles short-circuit] (the early-return writeback)
+[DEBUG sumsub→profiles] (the GREEN-handler writeback)
+📄 File 2: api/sumsub/status.js (Vercel serverless handler — production)
+What this file is
+The serverless equivalent of the Express route above. This is what actually runs in production on Vercel. Without porting the fix here, the writeback only works in local dev.
+
+What we changed
+Added import at the top:
+
+import { supabaseAdmin, supabase, authenticateUser } from "../_lib/supabase.js";
+
+Added a shared helper syncSumsubProfileFields(db, userId, applicant, tag) (after archiveDocuments). This is the single source of truth for the writeback logic — extracts ID/phone/address from the applicant payload, reads existing profile, updates only the blank fields, logs everything. The tag param lets us distinguish log lines between the GREEN path ("") and the short-circuit path (" short-circuit").
+
+Added optional Bearer auth at the start of the handler (same as Express version — uses the existing authenticateUser(req) helper from api/_lib/supabase.js).
+
+Added the writeback to the early-return short-circuit path — loads pack_details from the existing row and runs syncSumsubProfileFields.
+
+Added the writeback to the GREEN handler path — runs syncSumsubProfileFields on the live applicant object right after the pack is stored.
+
+How to integrate
+The whole file is rewritten in place. Diff it against your dev branch and accept the new version. The non-trivial new pieces are:
+
+The syncSumsubProfileFields function (~lines 111–166)
+The auth block (~lines 220–229)
+The short-circuit writeback (~lines 244–259)
+The GREEN-path writeback (~lines 353–358)
+⚠️ Production prerequisites
+SUPABASE_SERVICE_ROLE_KEY must be set in Vercel env (it already is — needed by other endpoints)
+VITE_SUPABASE_URL + VITE_SUPABASE_ANON_KEY must also be set (used by authenticateUser to validate JWTs)
+📄 File 3: api/_lib/supabase.js
+What this file is
+A small helper module that exports two ready-to-use Supabase clients (supabase = anon, supabaseAdmin = service role) and a authenticateUser(req) function that validates a Bearer JWT and returns { user, error }.
+
+What we changed
+Nothing in code. But api/sumsub/status.js now imports authenticateUser from it. Just confirm this file exists on your dev branch and exports authenticateUser — if it doesn't, copy it from this codebase. The function looks like this:
+
+export async function authenticateUser(req) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return { user: null, error: "Missing or invalid Authorization header" };
+  }
+  const token = authHeader.replace("Bearer ", "");
+  const { data, error } = await supabase.auth.getUser(token);
+  if (error || !data?.user) return { user: null, error: error?.message || "Invalid token" };
+  return { user: data.user, error: null };
+}
+
+📄 File 4: src/pages/UserOnboardingPage.jsx
+What this file is
+The 6-step onboarding wizard React component. Each step writes its data to either user_onboarding, profiles, or both via API calls.
+
+What we changed
+Change A — Added [DEBUG ...] logs at every save point. This is what let us pinpoint that the onboarding writes themselves were succeeding. Tags include:
+
+[DEBUG ensureOnboardingRecord], [DEBUG saveProgressFlag]
+[DEBUG addressSave] — residential address save
+[DEBUG identitySave] — also writes id_number to profiles
+[DEBUG employmentSave], [DEBUG financialStep], [DEBUG bankLetterUpload]
+[DEBUG mandateAccept], [DEBUG mandateSave-complete], [DEBUG onboardingComplete]
+[DEBUG loadOnboarding] — loading existing state
+These are safe to leave in for now (they don't log PII, only field names + row counts). Remove later if you want quieter logs.
+
+Change B — Mandate accept now POSTs save-mandate immediately (around line 1489). Previously, the mandate text was only persisted when the user reached the final completion step. If they bailed out, the mandate-accepted state was lost. Now it saves the moment the user taps "Accept".
+
+Change C — Bearer token added to the Sumsub status poll (~line 732). The page polls /api/sumsub/status while the Sumsub widget is open. We now grab the current Supabase session token and attach it as Authorization: Bearer ...:
+
+const { data: { session } } = await supabase.auth.getSession();
+const token = session?.access_token;
+const res = await fetch("/api/sumsub/status", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    ...(token && { Authorization: `Bearer ${token}` }),
+  },
+  body: JSON.stringify({ userId: user.id }),
+});
+
+This is the critical change — without it, the server's auth gate rejects the writeback for this caller.
+
+How to integrate
+Search the file for [DEBUG to find every change point, plus the Authorization header addition near the Sumsub polling code.
+
+📄 File 5: src/lib/useSumsubStatus.js
+What this file is
+A React hook used elsewhere in the app (Profile page, Dashboard, etc.) that polls the same /api/sumsub/status endpoint to keep KYC status fresh in the UI.
+
+What we changed
+Added the same Bearer token to its fetch (~line 125). Same reason — without it, polling from the Profile page wouldn't trigger the writeback either.
+
+const { data: { session } } = await supabase.auth.getSession();
+const token = session?.access_token;
+const res = await fetch("/api/sumsub/status", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    ...(token && { Authorization: `Bearer ${token}` }),
+  },
+  body: JSON.stringify({ userId }),
+});
+
+How to integrate
+Drop in the new fetch block. The hook's surface area is unchanged.
+
+🧩 How it all fits together (end-to-end flow)
+Scenario: a user opens the app and the status poll runs
+
+useSumsubStatus.js (or UserOnboardingPage.jsx) calls POST /api/sumsub/status with a Bearer token.
+The handler (api/sumsub/status.js in prod, server/index.cjs in dev) validates the token → authedUserId = user.id.
+The handler checks user_onboarding_pack_details:
+Already verified? → load the stored pack, run syncSumsubProfileFields(...), return verified.
+Not yet? → call Sumsub API for live applicant data; if GREEN, store the pack, run syncSumsubProfileFields(...), mark verified.
+syncSumsubProfileFields reads the user's current profiles row and writes id_number / phone_number / address only into blank fields (never overwrites real data).
+The user's Profile page now shows their phone number, ID, and address all populated.
+Auth gate logic (security):
+
+No token → writeback is skipped, but the rest of the route works normally (preserves existing webhook + anonymous flows).
+Token but for a different user → writeback skipped (logged as "caller not authenticated as this user").
+Token matches userId in the body → writeback runs.
+✅ Deployment checklist for your dev platform
+Pull the 4 modified files (server/index.cjs, api/sumsub/status.js, src/pages/UserOnboardingPage.jsx, src/lib/useSumsubStatus.js).
+Confirm api/_lib/supabase.js exports authenticateUser — if missing, copy from this codebase.
+Confirm Vercel has SUPABASE_SERVICE_ROLE_KEY, VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY set (it should already).
+Deploy. No DB migration required — we're just writing into existing columns.
+Smoke test: open Profile page as a verified user → check Vercel logs for [DEBUG sumsub→profiles short-circuit] profiles updated for ... fields=phone_number rows=1. Then refresh the page and the phone number should be visible.
