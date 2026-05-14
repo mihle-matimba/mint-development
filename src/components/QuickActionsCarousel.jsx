@@ -1,0 +1,114 @@
+import React, { useState, useEffect } from "react";
+import { ChevronLeft, ChevronRight } from "lucide-react";
+
+const QuickActionsCarousel = () => {
+  const [currentIndex, setCurrentIndex] = useState(0);
+  const [isAutoPlay, setIsAutoPlay] = useState(true);
+
+  const carouselItems = [
+    { id: 1, label: "Item 1", description: "Quick action item" },
+    { id: 2, label: "Item 2", description: "Quick action item" },
+    { id: 3, label: "Item 3", description: "Quick action item" },
+    { id: 4, label: "Item 4", description: "Quick action item" },
+  ];
+
+  useEffect(() => {
+    if (!isAutoPlay) return;
+
+    const interval = setInterval(() => {
+      setCurrentIndex((prevIndex) => (prevIndex + 1) % carouselItems.length);
+    }, 4000);
+
+    return () => clearInterval(interval);
+  }, [isAutoPlay, carouselItems.length]);
+
+  const handlePrev = () => {
+    setIsAutoPlay(false);
+    setCurrentIndex((prevIndex) =>
+      prevIndex === 0 ? carouselItems.length - 1 : prevIndex - 1
+    );
+  };
+
+  const handleNext = () => {
+    setIsAutoPlay(false);
+    setCurrentIndex((prevIndex) => (prevIndex + 1) % carouselItems.length);
+  };
+
+  const handleDotClick = (index) => {
+    setIsAutoPlay(false);
+    setCurrentIndex(index);
+  };
+
+  return (
+    <div className="w-full rounded-3xl bg-white shadow-[0_2px_16px_-2px_rgba(0,0,0,0.08)] p-4 overflow-hidden">
+      {/* Carousel Container */}
+      <div className="relative">
+        <div className="flex gap-4 overflow-hidden rounded-2xl">
+          {carouselItems.map((item, index) => (
+            <div
+              key={item.id}
+              className={`w-full flex-shrink-0 transform transition-opacity duration-500 ease-in-out ${
+                index === currentIndex ? "opacity-100" : "opacity-0 hidden"
+              }`}
+            >
+              <div className="h-40 rounded-2xl bg-gradient-to-br from-slate-300 to-slate-400 flex flex-col items-center justify-center gap-3 p-6">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-200">
+                  <span className="text-xs font-bold text-slate-600">
+                    {item.id}
+                  </span>
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-semibold text-slate-700">
+                    {item.label}
+                  </p>
+                  <p className="text-xs text-slate-600">{item.description}</p>
+                </div>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        {/* Navigation Buttons */}
+        <button
+          onClick={handlePrev}
+          className="absolute left-2 top-1/2 -translate-y-1/2 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white/90 text-slate-600 shadow-md transition-all active:scale-95 hover:bg-white"
+          aria-label="Previous item"
+        >
+          <ChevronLeft className="h-4 w-4" />
+        </button>
+        <button
+          onClick={handleNext}
+          className="absolute right-2 top-1/2 -translate-y-1/2 z-10 flex h-8 w-8 items-center justify-center rounded-full bg-white/90 text-slate-600 shadow-md transition-all active:scale-95 hover:bg-white"
+          aria-label="Next item"
+        >
+          <ChevronRight className="h-4 w-4" />
+        </button>
+      </div>
+
+      {/* Dot Indicators */}
+      <div className="mt-4 flex justify-center gap-2">
+        {carouselItems.map((_, index) => (
+          <button
+            key={index}
+            onClick={() => handleDotClick(index)}
+            className={`h-2 rounded-full transition-all ${
+              index === currentIndex
+                ? "w-6 bg-slate-500"
+                : "w-2 bg-slate-300 hover:bg-slate-400"
+            }`}
+            aria-label={`Go to item ${index + 1}`}
+          />
+        ))}
+      </div>
+
+      {/* Auto-play indicator */}
+      <div className="mt-3 text-center">
+        <p className="text-[10px] text-slate-400 uppercase tracking-wider">
+          {isAutoPlay ? "Auto-playing" : "Manual"}
+        </p>
+      </div>
+    </div>
+  );
+};
+
+export default QuickActionsCarousel;

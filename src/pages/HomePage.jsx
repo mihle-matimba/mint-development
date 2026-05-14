@@ -42,6 +42,7 @@ import SettlementBadge from "../components/PendingBadge";
 import NotificationBell from "../components/NotificationBell";
 import FamilyDropdown from "../components/FamilyDropdown";
 import HomeSkeleton from "../components/HomeSkeleton";
+import QuickActionsCarousel from "../components/QuickActionsCarousel";
 
 // Feature flags — set VITE_ENABLE_INSURE=true in Replit Secrets to preview.
 // Leave unset in Vercel production to keep the feature hidden from live users.
@@ -777,6 +778,8 @@ const HomePage = ({
             })}
           </div>
 
+          {/* Quick Actions Carousel */}
+          <QuickActionsCarousel />
         </section>
 
         {onboardingChecked && outstandingActions.length > 0 ? (
