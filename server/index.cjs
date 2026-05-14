@@ -2,30 +2,31 @@ const fs = require("fs");
 const path = require("path");
 
 // Simple .env loader for local development (no dotenv dependency required)
-try {
-  const envPath = path.join(__dirname, "..", ".env");
-  if (fs.existsSync(envPath)) {
-    const envContent = fs.readFileSync(envPath, "utf8");
-    envContent.split("\n").forEach(line => {
-      // Basic key=value parsing
-      const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
-      if (match) {
-        const key = match[1];
-        let value = match[2] || "";
-        // Remove quotes if present
-        if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
-        if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
-        // Only set if not already set by system environment
-        if (!process.env[key]) {
-          process.env[key] = value;
+function loadEnvFile(filePath, forceOverride) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const envContent = fs.readFileSync(filePath, "utf8");
+      envContent.split("\n").forEach(line => {
+        const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+        if (match) {
+          const key = match[1];
+          let value = match[2] || "";
+          if (value.startsWith('"') && value.endsWith('"')) value = value.slice(1, -1);
+          if (value.startsWith("'") && value.endsWith("'")) value = value.slice(1, -1);
+          if (forceOverride || !process.env[key]) {
+            process.env[key] = value;
+          }
         }
-      }
-    });
-    console.log("[Server] Local .env file loaded");
+      });
+      console.log(`[Server] Loaded ${path.basename(filePath)}`);
+    }
+  } catch (e) {
+    console.warn(`[Server] Could not load ${path.basename(filePath)}:`, e.message);
   }
-} catch (e) {
-  console.warn("[Server] Could not load .env file:", e.message);
 }
+// Load .env first (no override), then .env.local (force override) so local always wins
+loadEnvFile(path.join(__dirname, "..", ".env"), false);
+loadEnvFile(path.join(__dirname, "..", ".env.local"), true);
 
 const express = require("express");
 const cors = require("cors");
@@ -226,11 +227,51 @@ async function sendOrderConfirmationEmail(db, { userId, userEmail, assetName, as
   }
 }
 
-const pgPool = (process.env.SUPABASE_DB_URL || process.env.DATABASE_URL) ? new Pool({
-  connectionString: process.env.SUPABASE_DB_URL || process.env.DATABASE_URL,
+function parsePgUrl(url) {
+  // Handles passwords that contain '@' by treating the LAST '@' as the delimiter
+  // between credentials and host.
+  try {
+    const withoutScheme = url.replace(/^postgres(?:ql)?:\/\//, '');
+    const lastAt = withoutScheme.lastIndexOf('@');
+    const credentials = withoutScheme.slice(0, lastAt);
+    const hostPart = withoutScheme.slice(lastAt + 1);
+    const colonInCreds = credentials.indexOf(':');
+    const user = decodeURIComponent(credentials.slice(0, colonInCreds));
+    const password = decodeURIComponent(credentials.slice(colonInCreds + 1));
+    const slashIdx = hostPart.indexOf('/');
+    const hostPort = slashIdx !== -1 ? hostPart.slice(0, slashIdx) : hostPart;
+    const database = slashIdx !== -1 ? hostPart.slice(slashIdx + 1) : 'postgres';
+    const colonInHost = hostPort.lastIndexOf(':');
+    const host = colonInHost !== -1 ? hostPort.slice(0, colonInHost) : hostPort;
+    const port = colonInHost !== -1 ? parseInt(hostPort.slice(colonInHost + 1), 10) : 5432;
+    return { user, password, host, port, database };
+  } catch (e) {
+    console.error('[pgPool] Failed to parse SUPABASE_DB_URL:', e.message);
+    return null;
+  }
+}
+
+const _pgConfig = process.env.SUPABASE_DB_URL ? parsePgUrl(process.env.SUPABASE_DB_URL) : null;
+if (_pgConfig) {
+  console.log('[pgPool] Parsed config — user:', _pgConfig.user, '| host:', _pgConfig.host, '| port:', _pgConfig.port, '| db:', _pgConfig.database);
+} else {
+  console.log('[pgPool] No SUPABASE_DB_URL set, pgPool disabled');
+}
+const pgPool = _pgConfig ? new Pool({
+  ..._pgConfig,
   ssl: { rejectUnauthorized: false },
   max: 5,
 }) : null;
+
+async function safePoolConnect() {
+  if (!pgPool) return null;
+  try {
+    return await pgPool.connect();
+  } catch (e) {
+    console.error('[pgPool] Connection failed:', e.message);
+    return null;
+  }
+}
 
 const app = express();
 app.use(cors());
@@ -402,6 +443,11 @@ const SUPABASE_SERVICE_ROLE_KEY = readEnv('SUPABASE_SERVICE_ROLE_KEY');
 console.log('[startup] Supabase URL set:', !!SUPABASE_URL);
 console.log('[startup] Supabase anon key set:', !!SUPABASE_ANON_KEY);
 console.log('[startup] Supabase service role key set:', !!SUPABASE_SERVICE_ROLE_KEY);
+
+// Polyfill WebSocket for Node.js < 22
+if (!global.WebSocket) {
+  try { global.WebSocket = require('ws'); } catch (_) {}
+}
 
 let supabase = null;
 let supabaseAdmin = null;
@@ -604,7 +650,13 @@ migrateWalletColumns();
 
 async function ensureUserSessionsTable() {
   if (!pgPool) return;
-  const client = await pgPool.connect();
+  let client;
+  try {
+    client = await pgPool.connect();
+  } catch (e) {
+    console.error('[sessions] Could not connect to database:', e.message);
+    return;
+  }
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS user_sessions (
@@ -5122,7 +5174,8 @@ app.post("/api/sessions/record", async (req, res) => {
     }
     const { userAgent, browser, os, deviceType, sessionFingerprint } = req.body;
     const fingerprint = sessionFingerprint || user.id + "_" + Date.now();
-    const client = await pgPool.connect();
+    const client = await safePoolConnect();
+    if (!client) return res.status(503).json({ success: false, error: "Database connection unavailable" });
     try {
       await client.query("DELETE FROM user_sessions WHERE user_id = $1 AND session_token = $2", [user.id, fingerprint]);
       const result = await client.query(
@@ -5159,7 +5212,8 @@ app.get("/api/sessions/list", async (req, res) => {
       return res.status(500).json({ success: false, error: "Direct database not available" });
     }
     const currentFingerprint = req.query.fingerprint || "";
-    const client = await pgPool.connect();
+    const client = await safePoolConnect();
+    if (!client) return res.status(503).json({ success: false, error: "Database connection unavailable" });
     try {
       const result = await client.query(
         `SELECT id, user_id, browser, os, device_type, ip_address, created_at, last_active_at,
@@ -5199,7 +5253,8 @@ app.post("/api/sessions/revoke", async (req, res) => {
     if (!pgPool) {
       return res.status(500).json({ success: false, error: "Direct database not available" });
     }
-    const client = await pgPool.connect();
+    const client = await safePoolConnect();
+    if (!client) return res.status(503).json({ success: false, error: "Database connection unavailable" });
     try {
       await client.query("DELETE FROM user_sessions WHERE id = $1 AND user_id = $2", [sessionId, user.id]);
       res.json({ success: true });
@@ -5234,7 +5289,8 @@ app.post("/api/sessions/revoke-others", async (req, res) => {
     if (!pgPool) {
       return res.status(500).json({ success: false, error: "Direct database not available" });
     }
-    const client = await pgPool.connect();
+    const client = await safePoolConnect();
+    if (!client) return res.status(503).json({ success: false, error: "Database connection unavailable" });
     try {
       await client.query("DELETE FROM user_sessions WHERE user_id = $1 AND id != $2", [user.id, currentSessionId]);
       res.json({ success: true });
@@ -5269,7 +5325,8 @@ app.get("/api/sessions/validate", async (req, res) => {
     if (!pgPool) {
       return res.json({ success: true, valid: true });
     }
-    const client = await pgPool.connect();
+    const client = await safePoolConnect();
+    if (!client) return res.json({ success: true, valid: true });
     try {
       const result = await client.query(
         "SELECT id FROM user_sessions WHERE user_id = $1 AND session_token = $2 LIMIT 1",
@@ -5564,8 +5621,8 @@ app.post("/api/onboarding/check-id-number", async (req, res) => {
     let matchedEmail = null;
 
     if (pgPool) {
-      const client = await pgPool.connect();
-      try {
+      const client = await safePoolConnect();
+      if (client) try {
         const query = `
           SELECT user_id
           FROM user_onboarding_pack_details
@@ -7045,7 +7102,8 @@ async function ensureFamilyMembersTable() {
 
 async function ensureFamilyMembersTablePg() {
   if (!pgPool) return;
-  const client = await pgPool.connect();
+  const client = await safePoolConnect();
+  if (!client) return;
   try {
     await client.query(`
       CREATE TABLE IF NOT EXISTS family_members (
@@ -7100,7 +7158,8 @@ ensureFamilyMembersTable();
 // Helper: run a raw SQL query on the family_members table via pgPool (bypasses RLS)
 async function fmQuery(sql, params = []) {
   if (!pgPool) throw new Error('pgPool unavailable');
-  const client = await pgPool.connect();
+  const client = await safePoolConnect();
+  if (!client) throw new Error('pgPool connection failed');
   try {
     const r = await client.query(sql, params);
     return r.rows;
@@ -7635,7 +7694,8 @@ app.post("/api/insurance/save-policy", async (req, res) => {
     // ── Ensure insurance_policies table exists ──────────────────────────────
     if (pgPool) {
       try {
-        await pgPool.connect().then(async client => {
+        await safePoolConnect().then(async client => {
+          if (!client) return;
           try {
             await client.query(`
               CREATE TABLE IF NOT EXISTS insurance_policies (
