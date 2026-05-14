@@ -23,7 +23,7 @@ const QuickActionsCarousel = () => {
   };
 
   return (
-    <div className="w-full">
+    <div className="w-full relative">
       {/* Carousel Container */}
       <div className="relative rounded-2xl overflow-hidden">
         <div className="flex gap-4">
@@ -34,7 +34,7 @@ const QuickActionsCarousel = () => {
                 index === currentIndex ? "opacity-100" : "opacity-0 hidden"
               }`}
             >
-              <div className="h-40 rounded-2xl bg-gradient-to-br from-slate-300 to-slate-400 flex flex-col items-center justify-center gap-3 p-6">
+              <div className="aspect-square rounded-2xl bg-gradient-to-br from-slate-300 to-slate-400 flex flex-col items-center justify-center gap-3 p-6">
                 <div className="flex h-12 w-12 items-center justify-center rounded-full bg-slate-200">
                   <span className="text-xs font-bold text-slate-600">
                     {item.id}
@@ -50,22 +50,22 @@ const QuickActionsCarousel = () => {
             </div>
           ))}
         </div>
-      </div>
 
-      {/* Dot Indicators */}
-      <div className="mt-4 flex justify-center gap-2">
-        {carouselItems.map((_, index) => (
-          <button
-            key={index}
-            onClick={() => handleDotClick(index)}
-            className={`h-2 rounded-full transition-all ${
-              index === currentIndex
-                ? "w-6 bg-slate-500"
-                : "w-2 bg-slate-300 hover:bg-slate-400"
-            }`}
-            aria-label={`Go to item ${index + 1}`}
-          />
-        ))}
+        {/* Dot Indicators - Overlay */}
+        <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex justify-center gap-2 z-10">
+          {carouselItems.map((_, index) => (
+            <button
+              key={index}
+              onClick={() => handleDotClick(index)}
+              className={`h-2 rounded-full transition-all ${
+                index === currentIndex
+                  ? "w-6 bg-slate-500"
+                  : "w-2 bg-slate-300 hover:bg-slate-400"
+              }`}
+              aria-label={`Go to item ${index + 1}`}
+            />
+          ))}
+        </div>
       </div>
     </div>
   );
