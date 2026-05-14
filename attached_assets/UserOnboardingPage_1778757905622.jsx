@@ -228,47 +228,114 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
   };
 
   const ensureOnboardingRecord = async () => {
-    if (existingOnboardingId) return;
+    console.log("[DEBUG ensureOnboardingRecord] called. existingOnboardingId=", existingOnboardingId);
+    if (existingOnboardingId) {
+      console.log("[DEBUG ensureOnboardingRecord] short-circuit (already have id)");
+      return;
+    }
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const token = session?.access_token;
-      if (!token) return;
+      const userId = session?.user?.id;
+      console.log("[DEBUG ensureOnboardingRecord] session userId=", userId, "hasToken=", !!token);
+      if (!token) {
+        console.warn("[DEBUG ensureOnboardingRecord] NO TOKEN — aborting");
+        return;
+      }
       const res = await fetch("/api/onboarding/save-employment", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ employment_status: "not_provided", annual_income_currency: "ZAR" }),
       });
       const result = await res.json();
+      console.log("[DEBUG ensureOnboardingRecord] save-employment status=", res.status, "body=", result);
       if (result.success && result.onboarding_id) {
         setExistingOnboardingId(result.onboarding_id);
+        console.log("[DEBUG ensureOnboardingRecord] onboarding_id set to", result.onboarding_id);
+      } else {
+        console.error("[DEBUG ensureOnboardingRecord] FAILED to obtain onboarding_id, result=", result);
       }
     } catch (err) {
-      console.error("[Onboarding] Failed to ensure onboarding record:", err);
+      console.error("[DEBUG ensureOnboardingRecord] EXCEPTION:", err);
     }
   };
 
   const saveProgressFlag = async (flagKey, extraFields) => {
-    if (!supabase) return;
+    console.log("[DEBUG saveProgressFlag] called flag=", flagKey, "extraFields=", extraFields);
+    if (!supabase) {
+      console.warn("[DEBUG saveProgressFlag] supabase missing — aborting");
+      return;
+    }
     try {
       const { data: { session } } = await supabase.auth.getSession();
       const userId = session?.user?.id;
-      if (!userId) return;
+      console.log("[DEBUG saveProgressFlag] userId=", userId, "existingOnboardingId=", existingOnboardingId);
+      if (!userId) {
+        console.warn("[DEBUG saveProgressFlag] NO userId — aborting flag=", flagKey);
+        return;
+      }
       const id = existingOnboardingId || null;
-      const query = supabase.from("user_onboarding").select("sumsub_raw");
-      const { data: record } = id
+      const query = supabase.from("user_onboarding").select("id, sumsub_raw");
+      const { data: record, error: selErr } = id
         ? await query.eq("id", id).eq("user_id", userId).maybeSingle()
         : await query.eq("user_id", userId).order("created_at", { ascending: false }).limit(1).maybeSingle();
+      console.log("[DEBUG saveProgressFlag] lookup result for flag=", flagKey, "record=", record, "selErr=", selErr?.message);
+
+      // ── If no row exists, create one first so the flag isn't silently lost ──
+      if (!record) {
+        console.warn("[DEBUG saveProgressFlag] NO user_onboarding ROW for user", userId, "— creating one before saving flag", flagKey);
+        await ensureOnboardingRecord();
+        const { data: refetched, error: rfErr } = await supabase
+          .from("user_onboarding")
+          .select("id, sumsub_raw")
+          .eq("user_id", userId)
+          .order("created_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        console.log("[DEBUG saveProgressFlag] refetched after ensure: record=", refetched, "err=", rfErr?.message);
+        if (!refetched) {
+          console.error("[DEBUG saveProgressFlag] STILL no row after ensureOnboardingRecord — flag", flagKey, "WILL BE LOST");
+          return;
+        }
+        // proceed with the refetched row
+        record && (record.id = refetched.id);
+        Object.assign({}, record || {}, refetched);
+        // reassign by rebinding
+        // (we'll re-read below)
+        var rebound = refetched;
+        let raw = {};
+        try { raw = typeof rebound.sumsub_raw === "string" ? JSON.parse(rebound.sumsub_raw) : (rebound.sumsub_raw || {}); } catch (e) { console.warn("[DEBUG saveProgressFlag] raw JSON parse failed:", e.message); }
+        raw[flagKey] = true;
+        if (extraFields) Object.assign(raw, extraFields);
+        console.log("[DEBUG saveProgressFlag] (post-ensure) writing raw for flag=", flagKey, ":", raw);
+        const { data: updated, error: updErr } = await supabase
+          .from("user_onboarding")
+          .update({ sumsub_raw: raw })
+          .eq("id", rebound.id)
+          .eq("user_id", userId)
+          .select("id");
+        console.log("[DEBUG saveProgressFlag] (post-ensure) update result rows=", updated?.length, "err=", updErr?.message);
+        if (updErr) console.error("[Onboarding] saveProgressFlag failed for", flagKey, updErr.message);
+        return;
+      }
+
       let raw = {};
-      try { raw = typeof record?.sumsub_raw === "string" ? JSON.parse(record.sumsub_raw) : (record?.sumsub_raw || {}); } catch { }
+      try { raw = typeof record.sumsub_raw === "string" ? JSON.parse(record.sumsub_raw) : (record.sumsub_raw || {}); } catch (e) { console.warn("[DEBUG saveProgressFlag] raw JSON parse failed:", e.message); }
       raw[flagKey] = true;
       if (extraFields) Object.assign(raw, extraFields);
-      const updateQuery = supabase.from("user_onboarding").update({ sumsub_raw: raw });
-      const { error } = id
+      console.log("[DEBUG saveProgressFlag] writing raw for flag=", flagKey, ":", raw);
+
+      const updateQuery = supabase.from("user_onboarding").update({ sumsub_raw: raw }).select("id");
+      const { data: updated, error } = id
         ? await updateQuery.eq("id", id).eq("user_id", userId)
-        : await updateQuery.eq("user_id", userId);
+        : await updateQuery.eq("id", record.id).eq("user_id", userId);
+      console.log("[DEBUG saveProgressFlag] update result for flag=", flagKey, "affectedRows=", updated?.length, "err=", error?.message);
+      if (updated && updated.length === 0) {
+        console.error("[DEBUG saveProgressFlag] AFFECTED 0 ROWS — RLS policy or wrong user_id? flag=", flagKey, "userId=", userId, "recordId=", record.id);
+      }
       if (error) console.error("[Onboarding] saveProgressFlag failed for", flagKey, error.message);
     } catch (err) {
-      console.error("[Onboarding] saveProgressFlag error for", flagKey, err?.message);
+      console.error("[DEBUG saveProgressFlag] EXCEPTION for flag=", flagKey, err);
     }
   };
 
@@ -343,10 +410,29 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
         return;
       }
 
+      console.log("[DEBUG identitySave] check-id-number result=", result);
       await ensureOnboardingRecord();
 
       if (result.applicantId) {
         setApplicantId(result.applicantId);
+        console.log("[DEBUG identitySave] applicantId=", result.applicantId);
+      }
+
+      // Save id_number to profiles too — onboarding flow only wrote to user_onboarding.sumsub_raw
+      try {
+        const { data: { session: s2 } } = await supabase.auth.getSession();
+        if (s2?.user) {
+          const { data: profUpd, error: profErr } = await supabase
+            .from("profiles")
+            .update({ id_number: cleanIdNumber })
+            .eq("id", s2.user.id)
+            .select("id, id_number");
+          console.log("[DEBUG identitySave] profiles.id_number update rows=", profUpd?.length, "data=", profUpd, "err=", profErr?.message);
+          if (profErr) console.error("[DEBUG identitySave] PROFILES UPDATE FAILED:", profErr);
+          else if (!profUpd?.length) console.error("[DEBUG identitySave] PROFILES UPDATE AFFECTED 0 ROWS for user", s2.user.id);
+        }
+      } catch (e) {
+        console.error("[DEBUG identitySave] profile update exception:", e);
       }
 
       // Save the ID number and applicant ID to the onboarding record we just ensured exists
@@ -355,6 +441,7 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
       });
 
       setIdentityCheckConfirmed(true);
+      console.log("[DEBUG identitySave] DONE — identityCheckConfirmed=true");
     } catch (err) {
       setIdentityCheckError(err?.message || "Failed to verify ID number.");
     } finally {
@@ -445,6 +532,7 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
         existing_onboarding_id: existingOnboardingId || null,
       };
 
+      console.log("[DEBUG employmentSave] payload=", payload);
       const res = await fetch("/api/onboarding/save-employment", {
         method: "POST",
         headers: {
@@ -454,9 +542,14 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
         body: JSON.stringify(payload),
       });
       const result = await res.json();
-      if (!res.ok || !result.success) throw new Error(result.error || "Failed to save onboarding details.");
+      console.log("[DEBUG employmentSave] status=", res.status, "ok=", res.ok, "result=", result);
+      if (!res.ok || !result.success) {
+        console.error("[DEBUG employmentSave] FAILED:", result);
+        throw new Error(result.error || "Failed to save onboarding details.");
+      }
       if (result.onboarding_id) {
         setExistingOnboardingId(result.onboarding_id);
+        console.log("[DEBUG employmentSave] onboarding_id=", result.onboarding_id);
       }
 
       setSubmitSuccess("Onboarding details saved successfully.");
@@ -529,8 +622,12 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
           headers: { Authorization: `Bearer ${token}` },
         });
         const result = await res.json();
+        console.log("[DEBUG loadOnboarding] /status response=", result);
         if (result.success && result.onboarding_id) {
           setExistingOnboardingId(result.onboarding_id);
+          console.log("[DEBUG loadOnboarding] existingOnboardingId set to", result.onboarding_id);
+        } else {
+          console.warn("[DEBUG loadOnboarding] no onboarding_id in /status response");
         }
 
         const onboardingId = result.success && result.onboarding_id ? result.onboarding_id : null;
@@ -708,6 +805,7 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
       if (token) {
         if (mandateDataRef.current) {
           const savePayload = { ...mandateDataRef.current, agreedMandate };
+          console.log("[DEBUG mandateSave-complete] payload keys=", Object.keys(savePayload), "existing_onboarding_id=", existingOnboardingId);
           try {
             const mandateRes = await fetch("/api/onboarding/save-mandate", {
               method: "POST",
@@ -715,10 +813,14 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
               body: JSON.stringify({ mandate_data: savePayload, existing_onboarding_id: existingOnboardingId || null }),
             });
             const mandateResult = await mandateRes.json();
+            console.log("[DEBUG mandateSave-complete] status=", mandateRes.status, "ok=", mandateRes.ok, "result=", mandateResult);
+            if (!mandateRes.ok) console.error("[DEBUG mandateSave-complete] SAVE FAILED:", mandateResult);
             if (mandateResult.onboarding_id) setExistingOnboardingId(mandateResult.onboarding_id);
           } catch (e) {
-            console.error("Mandate save error during completion:", e);
+            console.error("[DEBUG mandateSave-complete] Mandate save EXCEPTION during completion:", e);
           }
+        } else {
+          console.warn("[DEBUG mandateSave-complete] mandateDataRef.current is EMPTY — nothing to save");
         }
 
         const completePayload = {
@@ -741,7 +843,7 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
           downloaded_at: signingResults.downloaded_at || null,
         };
 
-        console.log("[Onboarding] Completing with payload:", completePayload);
+        console.log("[DEBUG onboardingComplete] payload keys=", Object.keys(completePayload), "payload=", completePayload);
 
         const res = await fetch("/api/onboarding/complete", {
           method: "POST",
@@ -752,11 +854,13 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
           body: JSON.stringify(completePayload),
         });
         const result = await res.json();
+        console.log("[DEBUG onboardingComplete] status=", res.status, "ok=", res.ok, "result=", result);
         if (result.success) {
           completionSuccess = true;
           markOnboardingComplete();
+          console.log("[DEBUG onboardingComplete] SUCCESS — markOnboardingComplete called");
         } else {
-          console.error("Failed to complete onboarding via API:", result.error);
+          console.error("[DEBUG onboardingComplete] FAILED:", result.error);
           throw new Error(result.error?.message || "Failed to save completion status. Please try again.");
         }
 
@@ -973,6 +1077,7 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
                     type="button"
                     className="continue-button"
                     onClick={async () => {
+                      console.log("[DEBUG addressSave] click. address=", address, "len=", address?.length);
                       if (address && address.length > 5) {
                         setAddressLoading(true);
                         try {
@@ -980,12 +1085,20 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
                             throw new Error("Supabase not initialized");
                           }
                           const { data: { session } } = await supabase.auth.getSession();
+                          console.log("[DEBUG addressSave] userId=", session?.user?.id);
                           if (session?.user) {
                             // Save to profiles table
-                            await supabase
+                            const { data: profUpd, error: profErr } = await supabase
                               .from("profiles")
                               .update({ address: address })
-                              .eq("id", session.user.id);
+                              .eq("id", session.user.id)
+                              .select("id, address");
+                            console.log("[DEBUG addressSave] profiles update rows=", profUpd?.length, "data=", profUpd, "err=", profErr?.message);
+                            if (profErr) {
+                              console.error("[DEBUG addressSave] PROFILES UPDATE FAILED:", profErr);
+                            } else if (!profUpd?.length) {
+                              console.error("[DEBUG addressSave] PROFILES UPDATE AFFECTED 0 ROWS — RLS policy or missing profile row for", session.user.id);
+                            }
 
                             // Save flag to user_onboarding
                             await saveProgressFlag("address_saved", {
@@ -994,12 +1107,16 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
 
                             setAddressDone(true);
                             goToStep(getNextIncompleteStep(3));
+                          } else {
+                            console.warn("[DEBUG addressSave] no session.user — abort");
                           }
                         } catch (err) {
-                          console.error("Failed to save address:", err);
+                          console.error("[DEBUG addressSave] EXCEPTION:", err);
                         } finally {
                           setAddressLoading(false);
                         }
+                      } else {
+                        console.warn("[DEBUG addressSave] address too short or empty — not saving");
                       }
                     }}
                     disabled={!address || address.length < 5 || addressLoading}
@@ -1191,16 +1308,20 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
                               const base64 = evt.target.result;
                               const { data: { session } } = await supabase.auth.getSession();
                               const token = session?.access_token;
+                              console.log("[DEBUG bankLetterUpload] file size=", file.size, "type=", file.type, "hasToken=", !!token);
                               const res = await fetch("/api/onboarding/upload-bank-letter", {
                                 method: "POST",
                                 headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` },
                                 body: JSON.stringify({ fileBase64: base64, fileType: file.type }),
                               });
                               const result = await res.json();
+                              console.log("[DEBUG bankLetterUpload] status=", res.status, "ok=", res.ok, "result=", result);
                               if (result.success) {
                                 setBankLetterDone(true);
+                                console.log("[DEBUG bankLetterUpload] success, publicUrl=", result.publicUrl);
                                 await saveProgressFlag("bank_letter_uploaded", { bank_letter_url: result.publicUrl, bank_letter_uploaded_at: new Date().toISOString() });
                               } else {
+                                console.error("[DEBUG bankLetterUpload] FAILED:", result);
                                 setSubmitError(result.error || "Failed to upload file");
                               }
                               setIsSubmitting(false);
@@ -1284,16 +1405,24 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
                   className={`continue-button agreement-continue${taxNumber && taxNumber.length >= 6 && bankDetailsReady && bankLetterDone && sofReady ? ' enabled' : ''}`}
                   disabled={!(taxNumber && taxNumber.length >= 6 && bankDetailsReady && bankLetterDone && sofReady)}
                   onClick={async () => {
+                    console.log("[DEBUG financialStep] click. taxNumber=", taxNumber, "bankName=", bankName, "bankAccountNumber=", bankAccountNumber, "bankBranchCode=", bankBranchCode, "sourceOfFunds=", sourceOfFunds, "expectedMonthlyInvestment=", expectedMonthlyInvestment, "bankLetterDone=", bankLetterDone);
                     try {
                       const { data: { session } } = await supabase.auth.getSession();
                       const userId = session?.user?.id;
+                      console.log("[DEBUG financialStep] userId=", userId);
                       if (userId) {
-                        await supabase.from("user_onboarding").update({ bank_name: bankName || null, bank_account_number: bankAccountNumber || null, bank_branch_code: bankBranchCode || null }).eq("user_id", userId);
+                        const { data: bankUpd, error: bankErr } = await supabase.from("user_onboarding").update({ bank_name: bankName || null, bank_account_number: bankAccountNumber || null, bank_branch_code: bankBranchCode || null }).eq("user_id", userId).select("id, bank_name, bank_account_number");
+                        console.log("[DEBUG financialStep] user_onboarding bank update rows=", bankUpd?.length, "data=", bankUpd, "err=", bankErr?.message);
+                        if (bankErr) console.error("[DEBUG financialStep] BANK UPDATE FAILED:", bankErr);
+                        else if (!bankUpd?.length) console.error("[DEBUG financialStep] BANK UPDATE AFFECTED 0 ROWS for user", userId);
                       }
-                    } catch { }
+                    } catch (e) {
+                      console.error("[DEBUG financialStep] bank update EXCEPTION:", e);
+                    }
                     await saveProgressFlag("tax_details_saved", { tax_details: { tax_number: taxNumber, savedAt: new Date().toISOString() } });
                     await saveProgressFlag("bank_details_saved", { bank_details: { bank_name: bankName || null, bank_account_name: bankAccountName || null, bank_account_type: bankAccountType || null, bank_account_number: bankAccountNumber || null, bank_branch_code: bankBranchCode || null, savedAt: new Date().toISOString() } });
                     await saveProgressFlag("source_of_funds_accepted", { source_of_funds_details: { source_of_funds: sourceOfFunds, source_of_funds_other: sourceOfFunds === "other" ? sourceOfFundsOther : null, expected_monthly_investment: expectedMonthlyInvestment } });
+                    console.log("[DEBUG financialStep] all 3 saveProgressFlag calls returned");
                     setTaxDone(true);
                     setBankDone(true);
                     setSofDone(true);
@@ -1383,7 +1512,39 @@ const OnboardingProcessPage = ({ onBack, onComplete }) => {
                   type="button"
                   className={`continue-button agreement-continue ${agreedMandate && mandateValid ? "enabled" : ""}`}
                   disabled={!agreedMandate || !mandateValid}
-                  onClick={async () => { await saveProgressFlag("mandate_accepted"); setMandateDone(true); goToStep(getNextIncompleteStep(5, 5)); }}
+                  onClick={async () => {
+                    console.log("[DEBUG mandateAccept] click. agreedMandate=", agreedMandate, "mandateValid=", mandateValid, "mandateDataRef has data=", !!mandateDataRef.current);
+                    try {
+                      // Also POST mandate_data immediately so it isn't lost if user never reaches the final completion step
+                      if (mandateDataRef.current) {
+                        const { data: { session: ms } } = await supabase.auth.getSession();
+                        const tok = ms?.access_token;
+                        if (tok) {
+                          const payload = { ...mandateDataRef.current, agreedMandate: true };
+                          console.log("[DEBUG mandateAccept] POST /api/onboarding/save-mandate keys=", Object.keys(payload));
+                          const r = await fetch("/api/onboarding/save-mandate", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+                            body: JSON.stringify({ mandate_data: payload, existing_onboarding_id: existingOnboardingId || null }),
+                          });
+                          const rj = await r.json().catch(() => ({}));
+                          console.log("[DEBUG mandateAccept] save-mandate status=", r.status, "ok=", r.ok, "result=", rj);
+                          if (!r.ok) console.error("[DEBUG mandateAccept] save-mandate FAILED:", rj);
+                          if (rj?.onboarding_id) setExistingOnboardingId(rj.onboarding_id);
+                        } else {
+                          console.warn("[DEBUG mandateAccept] no auth token — skipping save-mandate POST");
+                        }
+                      } else {
+                        console.warn("[DEBUG mandateAccept] mandateDataRef.current is EMPTY at accept time");
+                      }
+                      await saveProgressFlag("mandate_accepted");
+                      console.log("[DEBUG mandateAccept] saveProgressFlag(mandate_accepted) returned");
+                    } catch (e) {
+                      console.error("[DEBUG mandateAccept] EXCEPTION:", e);
+                    }
+                    setMandateDone(true);
+                    goToStep(getNextIncompleteStep(5, 5));
+                  }}
                 >
                   Continue
                 </button>
